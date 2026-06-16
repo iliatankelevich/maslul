@@ -1,19 +1,25 @@
 """Grok provider — official xAI ``xai-sdk`` (gRPC; §8 resolved decision).
 
-Covers plain-text completion (M1) and tool-use translation (M2). The router owns the loop and
-rebuilds the conversation from normalized messages each turn, so this provider reconstructs the
-xAI chat statelessly: prior ``assistant`` tool-call turns become ``chat_pb2.Message`` protos with
-``tool_calls``, and tool results use ``tool_result(content, tool_call_id=...)`` (id-matched).
+The router owns the loop and rebuilds the conversation from normalized messages each turn, so
+this provider reconstructs the xAI chat statelessly: prior ``assistant`` tool-call turns become
+``chat_pb2.Message`` protos with ``tool_calls``, and tool results use
+``tool_result(content, tool_call_id=...)`` (id-matched).
 
 Verified live against ``grok-4.3`` — text + usage, and a calculator tool round-trip that
 exercises the reconstructed assistant tool-call turn (see
 ``tests/integration/test_providers_live.py``).
+
+Importing this module requires the ``grok`` extra (``pip install maslul[grok]``).
 """
 
 from __future__ import annotations
 
 import json
 from typing import Any
+
+import grpc
+from xai_sdk import AsyncClient
+from xai_sdk.chat import assistant, chat_pb2, system, tool, tool_result, user
 
 from maslul.errors import AuthError, ProviderError, RateLimited, Timeout
 from maslul.types import Message, ModelSpec, Request, Response, ToolCall, Usage
@@ -25,22 +31,14 @@ class GrokProvider:
     name = "grok"
 
     def __init__(self, *, api_key: str | None = None, client: Any | None = None) -> None:
-        if client is not None:
-            self._client: Any = client
-            return
-        from xai_sdk import AsyncClient
-
-        self._client = AsyncClient(api_key=api_key) if api_key else AsyncClient()
+        self._client: Any = client or (AsyncClient(api_key=api_key) if api_key else AsyncClient())
 
     async def complete(self, spec: ModelSpec, req: Request) -> Response:
-        from xai_sdk.chat import system as system_msg
-        from xai_sdk.chat import tool as make_tool
-
-        messages = [system_msg(s) for s in (req.system or [])] + _to_messages(req.messages)
+        messages = [system(s) for s in (req.system or [])] + _to_messages(req.messages)
         kwargs: dict[str, Any] = {"model": spec.model, "messages": messages}
         if req.tools:
             kwargs["tools"] = [
-                make_tool(name=t.name, description=t.description, parameters=t.input_schema)
+                tool(name=t.name, description=t.description, parameters=t.input_schema)
                 for t in req.tools
             ]
         max_tokens = req.max_tokens or spec.max_tokens
@@ -65,15 +63,11 @@ class GrokProvider:
         )
 
     async def healthcheck(self, spec: ModelSpec) -> None:
-        from xai_sdk.chat import user
-
         chat = self._client.chat.create(model=spec.model, messages=[user("ping")])
         await chat.sample()
 
 
 def _to_messages(messages: list[Message]) -> list[Any]:
-    from xai_sdk.chat import assistant, chat_pb2, tool_result, user
-
     out: list[Any] = []
     for m in messages:
         if m.role == "tool":
@@ -136,10 +130,6 @@ def _finish_reason(resp: Any) -> str | None:
 
 def _map_error(e: Exception) -> Exception:
     """Normalize a gRPC error to a :class:`~maslul.MaslulError`; pass others through."""
-    try:
-        import grpc
-    except ImportError:
-        return e
     if isinstance(e, grpc.aio.AioRpcError):
         code = e.code()
         if code in (grpc.StatusCode.UNAUTHENTICATED, grpc.StatusCode.PERMISSION_DENIED):

@@ -1,7 +1,11 @@
 """Provider drivers and the factory that builds them from ``[maslul.providers.*]`` config.
 
-``build_provider`` imports each backend's SDK lazily (inside the matching branch), so importing
-this package — or ``maslul`` itself — never pulls in a provider SDK you didn't install.
+This package is imported as part of ``import maslul`` (the router depends on it), so it must
+stay SDK-free. That is why ``build_provider`` defers importing each concrete provider module to
+the moment it's actually built — each provider module imports its SDK at top level, so importing
+``maslul.providers.anthropic`` requires the ``anthropic`` extra, importing
+``maslul.providers.gemini`` requires ``gemini``, etc. Deferring keeps ``import maslul`` working
+with only the extras you installed (locked in by ``tests/test_import_isolation.py``).
 """
 
 from __future__ import annotations
@@ -22,6 +26,9 @@ def build_provider(name: str, config: Mapping[str, Any]) -> Provider:
 
     Secrets are referenced by env-var name (``api_key_env``), never inlined. Used by
     :meth:`maslul.Router.from_toml` to auto-wire providers when none are injected.
+
+    The per-branch imports are deliberately deferred (see this module's docstring): they pull in
+    the SDK only for the provider you actually build, keeping ``import maslul`` SDK-free.
     """
     if name == "anthropic":
         from maslul.providers.anthropic import AnthropicProvider

@@ -5,11 +5,16 @@ Covers plain-text completion (M1) and the tool-use translation (M2): tool defs, 
 The loop itself is owned by the router; this provider only translates one turn each way.
 Anything the core doesn't model is passed through via ``req.provider_options`` (prompt caching,
 ``thinking``, ``output_config`` effort, …).
+
+Importing this module requires the ``anthropic`` extra (``pip install maslul[anthropic]``).
 """
 
 from __future__ import annotations
 
 from typing import Any
+
+import anthropic
+from anthropic import AsyncAnthropic
 
 from maslul.errors import AuthError, ProviderError, RateLimited, Timeout
 from maslul.types import Message, ModelSpec, Request, Response, ToolCall, Usage
@@ -25,12 +30,9 @@ class AnthropicProvider:
     def __init__(self, *, api_key: str | None = None, client: Any | None = None) -> None:
         """``client`` is for tests/advanced wiring; otherwise an ``AsyncAnthropic`` is built
         (resolving ``api_key`` or the ``ANTHROPIC_API_KEY`` environment variable)."""
-        if client is not None:
-            self._client: Any = client
-            return
-        from anthropic import AsyncAnthropic
-
-        self._client = AsyncAnthropic(api_key=api_key) if api_key else AsyncAnthropic()
+        self._client: Any = client or (
+            AsyncAnthropic(api_key=api_key) if api_key else AsyncAnthropic()
+        )
 
     async def complete(self, spec: ModelSpec, req: Request) -> Response:
         kwargs: dict[str, Any] = {
@@ -124,8 +126,6 @@ def _usage(u: Any) -> Usage:
 
 def _map_error(e: Exception) -> Exception:
     """Normalize an SDK exception to a :class:`~maslul.MaslulError`; pass others through."""
-    import anthropic
-
     if isinstance(e, anthropic.RateLimitError):
         return RateLimited(str(e))
     if isinstance(e, anthropic.APITimeoutError):

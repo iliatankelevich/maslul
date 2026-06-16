@@ -4,11 +4,16 @@ Mirrors Kippy's auth pattern: Vertex AI + Application Default Credentials (no AP
 ``vertex_project`` is set; an API-key path is supported for the Gemini Developer API. Covers
 plain-text completion (M1) and tool-use translation (M2): function declarations, the
 ``function_call``/``function_response`` round-trip, normalized usage, and finish reason.
+
+Importing this module requires the ``gemini`` extra (``pip install maslul[gemini]``).
 """
 
 from __future__ import annotations
 
 from typing import Any
+
+from google import genai
+from google.genai import types
 
 from maslul.errors import ProviderError
 from maslul.types import ModelSpec, Request, Response, ToolCall, Usage
@@ -29,10 +34,7 @@ class GeminiProvider:
     ) -> None:
         if client is not None:
             self._client: Any = client
-            return
-        from google import genai
-
-        if vertex_project:
+        elif vertex_project:
             self._client = genai.Client(
                 vertexai=True, project=vertex_project, location=vertex_location
             )
@@ -42,8 +44,6 @@ class GeminiProvider:
             self._client = genai.Client()  # resolve from ADC / environment
 
     async def complete(self, spec: ModelSpec, req: Request) -> Response:
-        from google.genai import types
-
         config: dict[str, Any] = {}
         if req.system:
             config["system_instruction"] = "\n\n".join(req.system)
@@ -91,8 +91,6 @@ class GeminiProvider:
 
 
 def _contents(req: Request) -> list[Any]:
-    from google.genai import types
-
     out: list[Any] = []
     for m in req.messages:
         if m.role == "tool":
