@@ -13,7 +13,7 @@ from typing import Any
 import pytest
 
 from maslul import Level, Router
-from maslul.types import MediaPart, Message, ModelSpec, Request, ToolDef
+from maslul.types import MediaPart, Message, ModelSpec, Request, Response, ToolDef
 
 requires_anthropic = pytest.mark.skipif(
     not os.getenv("ANTHROPIC_API_KEY"), reason="ANTHROPIC_API_KEY not set"
@@ -312,3 +312,35 @@ async def test_anthropic_classify_and_answer_live() -> None:
     )
     assert "4" in resp.text
     assert resp.level_used is None  # the floor model answered inline (no escalation)
+
+
+@requires_anthropic
+async def test_anthropic_verify_cascade_live() -> None:
+    from maslul.providers.anthropic import AnthropicProvider
+
+    config = {
+        "maslul": {
+            "strategy": "verify_cascade",
+            "default_level": "hard",
+            "tiers": {
+                "simple": {"provider": "anthropic", "model": _FAST},
+                "hard": {"provider": "anthropic", "model": _HARD},
+            },
+        }
+    }
+    seen: list[str] = []
+
+    def reject(_req: Request, resp: Response) -> bool:  # always escalate; record the cheap model
+        seen.append(resp.model)
+        return False
+
+    router = Router(config, providers={"anthropic": AnthropicProvider()}, verifier=reject)
+    resp = await router.complete(
+        Request(
+            messages=[Message(role="user", content="Name the capital of France.")], max_tokens=512
+        )
+    )
+    assert seen == [_FAST]  # the verifier saw the cheap (haiku) answer
+    assert resp.level_used is Level.HARD  # escalated to the most capable tier
+    assert resp.model == _HARD
+    assert {r.model for r in resp.usage_records} == {_FAST, _HARD}  # both attributed

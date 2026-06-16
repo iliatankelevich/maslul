@@ -42,6 +42,7 @@ from maslul.types import (
     ToolDef,
     ToolExecutor,
     Usage,
+    Verifier,
 )
 
 try:
@@ -82,6 +83,7 @@ __all__ = [
     "ToolDef",
     "ToolExecutor",
     "Usage",
+    "Verifier",
     "default_hard_signal",
     "__version__",
 ]

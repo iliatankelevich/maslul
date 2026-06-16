@@ -10,8 +10,9 @@ Routing decision order (plan §1.3), highest precedence first:
 
 Strategies for the middle: ``ROUTE_DEFAULT`` (default-to-capable), ``CLASSIFY`` (a cheap
 dedicated classifier model labels the level, cached + budget-guarded, then dispatch to that
-tier), and ``CLASSIFY_AND_ANSWER`` (the classifier model answers directly, or emits the
-escalation sentinel to bump to a stronger tier). ``VERIFY_CASCADE`` is M5.
+tier), ``CLASSIFY_AND_ANSWER`` (the classifier model answers directly, or emits the escalation
+sentinel to bump to a stronger tier), and ``VERIFY_CASCADE`` (answer cheap, then a caller-
+supplied verifier accepts it or escalates to the most capable tier).
 
 The tool-use loop (M2) and structured-output decode (M3) run underneath whichever model
 routing selects. Every model call (classify + answer + tool iterations) is recorded into the
@@ -52,6 +53,7 @@ from maslul.types import (
     Strategy,
     ToolCall,
     Usage,
+    Verifier,
 )
 
 # Guard against a runaway tool loop (mirrors Kippy's llm.py).
@@ -106,6 +108,7 @@ class Router:
         bypass_predicate: BypassPredicate | None = None,
         hard_signal: HardSignal | None = None,
         classifier: Classifier | None = None,
+        verifier: Verifier | None = None,
         on_route: RouteHook | None = None,
         on_complete: CompleteHook | None = None,
         on_error: ErrorHook | None = None,
@@ -122,6 +125,7 @@ class Router:
         self._bypass = bypass_predicate
         self._hard_signal = hard_signal or default_hard_signal
         self._classifier = classifier
+        self._verifier = verifier
         self._on_route: list[RouteHook] = [on_route] if on_route else []
         self._on_complete: list[CompleteHook] = [on_complete] if on_complete else []
         self._on_error: list[ErrorHook] = [on_error] if on_error else []
@@ -225,7 +229,29 @@ class Router:
             return await self._classify(req), None
         if strategy is Strategy.CLASSIFY_AND_ANSWER:
             return await self._classify_and_answer(req)
-        raise NotImplementedError(f"strategy {strategy.value!r} (VERIFY_CASCADE) lands in M5")
+        if strategy is Strategy.VERIFY_CASCADE:
+            return await self._verify_cascade(req)
+        raise ConfigError(f"unhandled strategy {strategy.value!r}")
+
+    async def _verify_cascade(self, req: Request) -> tuple[RoutingDecision, Response | None]:
+        """VERIFY_CASCADE: answer at the cheapest tier, run the caller's verifier, and escalate
+        to the most capable tier if it rejects — catching silent under-escalation."""
+        if self._verifier is None:
+            raise ConfigError("VERIFY_CASCADE needs a verifier (Router(verifier=...))")
+        floor = min(self._config.tiers)
+        floor_spec = self._spec_for_level(floor)
+        cheap = await self._execute(floor_spec, floor, req)
+        ok = self._verifier(req, cheap)
+        if inspect.isawaitable(ok):
+            ok = await ok
+        target = max(self._config.tiers)
+        if ok or target <= floor:  # accepted, or nothing stronger to escalate to
+            return RoutingDecision(floor_spec, floor, "verify_cascade:accepted"), cheap
+        record = ModelUsage(floor_spec.provider, floor_spec.model, cheap.usage)
+        decision = RoutingDecision(
+            self._spec_for_level(target), target, "verify_cascade:escalate", record
+        )
+        return decision, None
 
     async def _classify(self, req: Request) -> RoutingDecision:
         """CLASSIFY: a cheap dedicated classifier model labels the level (cached + budget-guarded),

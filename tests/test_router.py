@@ -200,12 +200,40 @@ async def test_classify_without_classifier_config_raises() -> None:
         await router.complete(_req())
 
 
-async def test_verify_cascade_deferred_to_m5() -> None:
-    config = _config()
-    config["maslul"]["strategy"] = "verify_cascade"
-    router = Router(config, providers={"fake": FakeProvider("fake")})
-    with pytest.raises(NotImplementedError):
-        await router.complete(_req())
+async def test_verify_cascade_requires_a_verifier() -> None:
+    router = Router(_config(), providers={"fake": FakeProvider("fake")})
+    with pytest.raises(ConfigError):
+        await router.complete(_req(), strategy=Strategy.VERIFY_CASCADE)
+
+
+async def test_verify_cascade_accepts_cheap_answer() -> None:
+    fake = FakeProvider("fake", text="cheap answer")
+
+    async def accept(_req: Request, _resp: Response) -> bool:  # async verifier supported
+        return True
+
+    router = Router(_config(), providers={"fake": fake}, verifier=accept)
+    resp = await router.complete(_req(), strategy=Strategy.VERIFY_CASCADE)
+    assert resp.text == "cheap answer"
+    assert resp.level_used is Level.SIMPLE  # cheapest tier, accepted
+    assert resp.model == "small"
+
+
+async def test_verify_cascade_escalates_when_rejected() -> None:
+    fake = FakeProvider("fake")
+    verified: list[str] = []
+
+    def reject(_req: Request, resp: Response) -> bool:
+        verified.append(resp.model)
+        return False  # the cheap answer isn't good enough → escalate
+
+    router = Router(_config(), providers={"fake": fake}, verifier=reject)
+    resp = await router.complete(_req(), strategy=Strategy.VERIFY_CASCADE)
+    assert resp.level_used is Level.HARD  # escalated to the most capable tier
+    assert resp.model == "big"
+    assert resp.classification_usage is not None  # the cheap attempt still counts
+    assert {r.model for r in resp.usage_records} == {"small", "big"}  # floor + escalated
+    assert verified == ["small"]  # the verifier saw the cheap (SIMPLE) answer
 
 
 async def test_missing_provider_raises_config_error() -> None:
