@@ -18,7 +18,7 @@ from maslul.errors import (
     Timeout,
 )
 from maslul.providers.base import Provider
-from maslul.router import Router, default_hard_signal
+from maslul.router import ESCALATE_SENTINEL, Router, default_hard_signal
 from maslul.types import (
     KNOWN_PROVIDERS,
     BypassPredicate,
@@ -49,6 +49,7 @@ except PackageNotFoundError:  # pragma: no cover - running from a source tree wi
     __version__ = "0.0.0"
 
 __all__ = [
+    "ESCALATE_SENTINEL",
     "KNOWN_PROVIDERS",
     "AuthError",
     "BypassPredicate",

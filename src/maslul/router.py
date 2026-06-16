@@ -8,14 +8,20 @@ Routing decision order (plan §1.3), highest precedence first:
     3. hard-signal detector     → HARD (UP-only; never routes down)
     4. ambiguous middle         → a caller-supplied classifier, else the configured Strategy
 
-M4 part 1 implements 0–3, ``ROUTE_DEFAULT``, and the custom-classifier hook; the LLM
-``CLASSIFY`` / ``CLASSIFY_AND_ANSWER`` strategies are part 2. The tool-use loop (M2) and
-structured-output decode (M3) run underneath whichever model routing selects.
+Strategies for the middle: ``ROUTE_DEFAULT`` (default-to-capable), ``CLASSIFY`` (a cheap
+dedicated classifier model labels the level, cached + budget-guarded, then dispatch to that
+tier), and ``CLASSIFY_AND_ANSWER`` (the classifier model answers directly, or emits the
+escalation sentinel to bump to a stronger tier). ``VERIFY_CASCADE`` is M5.
+
+The tool-use loop (M2) and structured-output decode (M3) run underneath whichever model
+routing selects. Every model call (classify + answer + tool iterations) is recorded into the
+response's per-model usage breakdown.
 """
 
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import inspect
 import json
 import os
@@ -47,6 +53,33 @@ from maslul.types import (
 
 # Guard against a runaway tool loop (mirrors Kippy's llm.py).
 _MAX_TOOL_ITERATIONS = 8
+# Headroom for a classify call — small, but enough for a thinking classifier to reason then label.
+_CLASSIFY_MAX_TOKENS = 512
+
+#: Emitted verbatim by a CLASSIFY_AND_ANSWER model that declines to answer and wants escalation.
+ESCALATE_SENTINEL = "⟦MASLUL::ESCALATE::hard⟧"
+_ESCALATE_RE = re.compile(r"^\s*⟦MASLUL::ESCALATE::(\w+)⟧")
+
+_LEVEL_BY_NAME = {"simple": Level.SIMPLE, "medium": Level.MEDIUM, "hard": Level.HARD}
+_LEVEL_SCHEMA = {
+    "type": "object",
+    "properties": {"level": {"type": "string", "enum": ["simple", "medium", "hard"]}},
+    "required": ["level"],
+    "additionalProperties": False,
+}
+_CLASSIFY_INSTRUCTIONS = (
+    "You are a routing classifier. Decide how much *reasoning capability* the assistant needs "
+    "to answer the user's request CORRECTLY — judge intrinsic difficulty, not how long the "
+    "answer should be (a short prompt can be very hard; a long paste can be trivial). "
+    "simple = trivial lookups, greetings, reformatting; medium = moderate or short multi-step "
+    "reasoning; hard = deep reasoning, research, proofs, analysis, ambiguous or high-stakes. "
+    "When unsure, pick the harder level. Respond with the level only."
+)
+_CLASSIFY_AND_ANSWER_GUIDANCE = (
+    "Answer the user's request directly if you can do so correctly. If answering it correctly "
+    "needs a more capable model, do NOT attempt it — reply with EXACTLY this and nothing "
+    f"else: {ESCALATE_SENTINEL}"
+)
 
 
 class Router:
@@ -87,6 +120,7 @@ class Router:
         self._classifier = classifier
         self._on_route: list[RouteHook] = [on_route] if on_route else []
         self._on_complete: list[CompleteHook] = [on_complete] if on_complete else []
+        self._classify_cache: dict[str, Level] = {}
 
     @classmethod
     def from_toml(
@@ -125,10 +159,14 @@ class Router:
         otherwise the routing brain decides (bypass → hard-signal → strategy/classifier). With
         ``req.tools`` + ``req.tool_executor`` the provider-agnostic tool loop runs underneath.
         """
-        decision = await self._route(req, level=level, model=model, strategy=strategy)
+        strat = strategy or self._config.strategy
+        decision, prepared = await self._route(req, level=level, model=model, strategy=strat)
         for cb in self._on_route:
             cb(req, decision)
-        resp = await self._execute(decision.spec, req)
+        if prepared is not None:  # CLASSIFY_AND_ANSWER answered inline
+            resp = self._finalize(req, prepared, _ledger_of(prepared))
+        else:
+            resp = await self._execute(decision.spec, req, decision.classification)
         resp.level_used = decision.level
         for cb in self._on_complete:
             cb(resp)
@@ -140,51 +178,118 @@ class Router:
         *,
         level: Level | None,
         model: str | ModelSpec | None,
-        strategy: Strategy | None,
-    ) -> RoutingDecision:
+        strategy: Strategy,
+    ) -> tuple[RoutingDecision, Response | None]:
         if model is not None:  # 0. explicit model pin
             spec = model if isinstance(model, ModelSpec) else ModelSpec.parse(model)
-            return RoutingDecision(spec=spec, level=None, reason="model_pinned")
+            return RoutingDecision(spec, None, "model_pinned"), None
         if level is not None:  # 1. explicit level pin
-            return RoutingDecision(self._spec_for_level(level), level, "level_pinned")
+            return RoutingDecision(self._spec_for_level(level), level, "level_pinned"), None
         if self._bypass is not None:  # 2. deterministic bypass (any tier)
             bypass_level = self._bypass(req)
             if bypass_level is not None:
-                return RoutingDecision(self._spec_for_level(bypass_level), bypass_level, "bypass")
+                return RoutingDecision(
+                    self._spec_for_level(bypass_level), bypass_level, "bypass"
+                ), None
         if self._hard_signal(req):  # 3. hard-signal (UP-only)
-            return RoutingDecision(self._spec_for_level(Level.HARD), Level.HARD, "hard_signal")
-        strat = strategy or self._config.strategy  # 4. ambiguous middle
-        chosen = await self._resolve_middle(req, strat)
-        return RoutingDecision(self._spec_for_level(chosen), chosen, f"strategy:{strat.value}")
+            return RoutingDecision(
+                self._spec_for_level(Level.HARD), Level.HARD, "hard_signal"
+            ), None
+        return await self._resolve_middle(req, strategy)  # 4. ambiguous middle
 
-    async def _resolve_middle(self, req: Request, strategy: Strategy) -> Level:
+    async def _resolve_middle(
+        self, req: Request, strategy: Strategy
+    ) -> tuple[RoutingDecision, Response | None]:
         """Resolve the ambiguous middle: a caller-supplied classifier wins; else the strategy."""
         if self._classifier is not None:
             result = self._classifier(req)
             if inspect.isawaitable(result):
                 result = await result
             if result is not None:
-                return result
+                return RoutingDecision(self._spec_for_level(result), result, "classifier"), None
         if strategy is Strategy.ROUTE_DEFAULT:
-            return self._config.default_level
-        raise NotImplementedError(
-            f"strategy {strategy.value!r} lands in M4 part 2 — "
-            "use route_default or inject a classifier"
-        )
+            level = self._config.default_level
+            return RoutingDecision(
+                self._spec_for_level(level), level, "strategy:route_default"
+            ), None
+        if strategy is Strategy.CLASSIFY:
+            return await self._classify(req), None
+        if strategy is Strategy.CLASSIFY_AND_ANSWER:
+            return await self._classify_and_answer(req)
+        raise NotImplementedError(f"strategy {strategy.value!r} (VERIFY_CASCADE) lands in M5")
 
-    async def _execute(self, spec: ModelSpec, req: Request) -> Response:
+    async def _classify(self, req: Request) -> RoutingDecision:
+        """CLASSIFY: a cheap dedicated classifier model labels the level (cached + budget-guarded),
+        then we dispatch to that tier. Classify usage is attributed on the decision."""
+        spec = self._require_classifier()
+        text = _request_text(req)
+        if _approx_tokens(text) < self._config.min_tokens_to_classify:  # budget guard
+            level = self._config.default_level
+            return RoutingDecision(self._spec_for_level(level), level, "classify:below_budget")
+        cache_key = _classify_cache_key(spec, text)
+        cached = self._classify_cache.get(cache_key)
+        if cached is not None:
+            return RoutingDecision(self._spec_for_level(cached), cached, "classify:cached")
+        provider = self._provider_for(spec)
+        classify_req = Request(
+            messages=[Message(role="user", content=text)],
+            system=[_CLASSIFY_INSTRUCTIONS],
+            response_format=_LEVEL_SCHEMA,
+            max_tokens=_CLASSIFY_MAX_TOKENS,
+        )
+        resp = await provider.complete(spec, classify_req)
+        level = _parse_classified_level(resp.text)
+        self._classify_cache[cache_key] = level
+        record = ModelUsage(spec.provider, spec.model, resp.usage)
+        return RoutingDecision(self._spec_for_level(level), level, "classify", record)
+
+    async def _classify_and_answer(self, req: Request) -> tuple[RoutingDecision, Response | None]:
+        """CLASSIFY_AND_ANSWER: one call to the classifier model. It either answers directly, or
+        emits the escalation sentinel — then we re-dispatch the original request to a stronger
+        tier."""
+        spec = self._require_classifier()
+        provider = self._provider_for(spec)
+        guided = replace(req, system=[_CLASSIFY_AND_ANSWER_GUIDANCE, *(req.system or [])])
+        resp = await provider.complete(spec, guided)
+        target = _parse_escalation(resp.text)
+        if target is not None:  # declined → escalate; the classifier call still cost tokens
+            record = ModelUsage(spec.provider, spec.model, resp.usage)
+            decision = RoutingDecision(
+                self._spec_for_level(target), target, "classify_and_answer:escalate", record
+            )
+            return decision, None
+        return RoutingDecision(spec, None, "classify_and_answer:answered"), resp
+
+    async def _execute(
+        self, spec: ModelSpec, req: Request, classification: ModelUsage | None = None
+    ) -> Response:
         """Run the model (with the tool loop when tools are present), decode structured output,
-        and attach the per-model usage breakdown."""
+        and attach the per-model usage breakdown (seeded with any prior classify call)."""
         provider = self._provider_for(spec)
         ledger: dict[tuple[str, str], Usage] = {}
+        if classification is not None:
+            _record_usage(
+                ledger, classification.provider, classification.model, classification.usage
+            )
         if not req.tools or req.tool_executor is None:
             resp = await provider.complete(spec, req)
             _record(ledger, resp)
         else:
             resp = await self._run_tool_loop(spec, provider, req, ledger)
+        return self._finalize(req, resp, ledger, classification)
+
+    def _finalize(
+        self,
+        req: Request,
+        resp: Response,
+        ledger: dict[tuple[str, str], Usage],
+        classification: ModelUsage | None = None,
+    ) -> Response:
         _apply_structured(req, resp)
         resp.usage = _total(ledger)
         resp.usage_records = [ModelUsage(p, m, u) for (p, m), u in ledger.items()]
+        if classification is not None:
+            resp.classification_usage = classification.usage
         return resp
 
     async def _run_tool_loop(
@@ -213,6 +318,11 @@ class Router:
                     Message(role="tool", content=result, tool_call_id=call.id, name=call.name)
                 )
         raise ProviderError(f"tool loop exceeded {_MAX_TOOL_ITERATIONS} iterations")
+
+    def _require_classifier(self) -> ModelSpec:
+        if self._config.classifier is None:
+            raise ConfigError("this strategy needs a [maslul.classifier] config entry")
+        return self._config.classifier
 
     def _provider_names(self) -> set[str]:
         """Provider names referenced by the configured tiers and classifier."""
@@ -252,14 +362,57 @@ def default_hard_signal(req: Request) -> bool:
     ``short ⇒ simple`` rule (plan §1.1): absence of a signal means *undecided*, not *easy*."""
     if req.media:
         return True
-    text = "\n".join(m.content for m in req.messages if m.content)
+    text = _request_text(req)
     if len(text) > _LONG_CONTEXT_CHARS or "```" in text:
         return True
     return bool(_HARD_SIGNAL_KEYWORDS.search(text))
 
 
+def _request_text(req: Request) -> str:
+    return "\n".join(m.content for m in req.messages if m.content)
+
+
+def _approx_tokens(text: str) -> int:
+    return max(1, len(text) // 4)  # rough; the budget guard only needs an order-of-magnitude
+
+
+def _classify_cache_key(spec: ModelSpec, text: str) -> str:
+    digest = hashlib.sha256(text.encode()).hexdigest()
+    return f"{spec.provider}:{spec.model}:{digest}"
+
+
+def _parse_classified_level(text: str) -> Level:
+    """Read a classifier reply into a Level. Unknown/garbled → HARD (escalate up, never down)."""
+    try:
+        name = json.loads(text).get("level", "")
+    except (ValueError, TypeError, AttributeError):
+        name = text
+    return _LEVEL_BY_NAME.get(str(name).strip().lower(), Level.HARD)
+
+
+def _parse_escalation(text: str) -> Level | None:
+    """The escalation sentinel names a target level; tolerate leading whitespace + a trailing
+    reason line. Returns None when the text is a real answer (no sentinel)."""
+    match = _ESCALATE_RE.match(text or "")
+    if match is None:
+        return None
+    return _LEVEL_BY_NAME.get(match.group(1).lower(), Level.HARD)
+
+
+def _ledger_of(resp: Response) -> dict[tuple[str, str], Usage]:
+    ledger: dict[tuple[str, str], Usage] = {}
+    _record(ledger, resp)
+    return ledger
+
+
 def _record(ledger: dict[tuple[str, str], Usage], resp: Response) -> None:
-    _accumulate(ledger.setdefault((resp.provider, resp.model), Usage()), resp.usage)
+    _record_usage(ledger, resp.provider, resp.model, resp.usage)
+
+
+def _record_usage(
+    ledger: dict[tuple[str, str], Usage], provider: str, model: str, usage: Usage
+) -> None:
+    _accumulate(ledger.setdefault((provider, model), Usage()), usage)
 
 
 def _total(ledger: dict[tuple[str, str], Usage]) -> Usage:

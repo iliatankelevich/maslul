@@ -177,8 +177,9 @@ class RoutingDecision:
     """Why the router picked this model — passed to the ``on_route`` hook for observability."""
 
     spec: ModelSpec
-    level: Level | None  # None when a model was pinned directly
-    reason: str  # model_pinned | level_pinned | bypass | hard_signal | strategy:<name>
+    level: Level | None  # None when a model was pinned directly or a classifier answered inline
+    reason: str  # model_pinned | level_pinned | bypass | hard_signal | classifier | strategy:*
+    classification: ModelUsage | None = None  # tokens spent on a separate classify call, if any
 
 
 #: Resolves the difficulty tier for a request, or returns None to defer to the configured

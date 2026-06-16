@@ -123,12 +123,87 @@ async def test_usage_records_expose_per_model_breakdown() -> None:
     assert resp.usage_records == [ModelUsage(provider="fake", model="small", usage=resp.usage)]
 
 
-async def test_classify_strategy_deferred_to_part2() -> None:
+def _classify_config(
+    strategy: str, *, classifier_model: str = "judge", min_tokens: int = 1
+) -> dict[str, Any]:
+    config = _config()
+    config["maslul"]["strategy"] = strategy
+    config["maslul"]["min_tokens_to_classify"] = min_tokens
+    config["maslul"]["classifier"] = {"provider": "fake", "model": classifier_model}
+    return config
+
+
+async def test_classify_strategy_routes_via_classifier_model() -> None:
+    fake = FakeProvider("fake", text='{"level": "medium"}')
+    router = Router(_classify_config("classify"), providers={"fake": fake})
+    resp = await router.complete(
+        Request(messages=[Message(role="user", content="a real question")])
+    )
+    assert resp.level_used is Level.MEDIUM
+    assert resp.model == "mid"  # the MEDIUM tier
+    assert resp.classification_usage is not None
+    assert {r.model for r in resp.usage_records} == {"judge", "mid"}  # classifier + answer
+
+
+async def test_classify_budget_guard_skips_to_default() -> None:
+    fake = FakeProvider("fake", text='{"level": "simple"}')
+    router = Router(_classify_config("classify", min_tokens=1000), providers={"fake": fake})
+    resp = await router.complete(Request(messages=[Message(role="user", content="hi")]))
+    assert resp.level_used is Level.HARD  # below budget → default_level, classifier skipped
+    assert all(r.model != "judge" for r in resp.usage_records)
+
+
+async def test_classify_caches_by_prompt() -> None:
+    fake = FakeProvider("fake", text='{"level": "simple"}')
+    router = Router(_classify_config("classify"), providers={"fake": fake})
+    req = Request(messages=[Message(role="user", content="identical question")])
+    await router.complete(req)
+    after_first = len(fake.calls)  # classify + answer
+    await router.complete(req)
+    assert len(fake.calls) - after_first == 1  # classify cached → only the answer call
+
+
+async def test_classify_and_answer_answers_inline() -> None:
+    fake = FakeProvider("fake", text="The answer is 42.")
+    router = Router(
+        _classify_config("classify_and_answer", classifier_model="floor"), providers={"fake": fake}
+    )
+    resp = await router.complete(_req())
+    assert resp.text == "The answer is 42."
+    assert resp.level_used is None  # the classifier answered; not a tier decision
+    assert len(fake.calls) == 1  # a single combined call
+    assert resp.usage_records[0].model == "floor"
+
+
+async def test_classify_and_answer_escalates_on_sentinel() -> None:
+    from maslul import ESCALATE_SENTINEL
+
+    fake = FakeProvider("fake", text=ESCALATE_SENTINEL)
+    router = Router(
+        _classify_config("classify_and_answer", classifier_model="floor"), providers={"fake": fake}
+    )
+    resp = await router.complete(_req())
+    assert resp.level_used is Level.HARD  # sentinel → re-dispatch to HARD tier
+    assert resp.model == "big"
+    assert resp.classification_usage is not None  # the declined classifier call still counts
+    assert len(fake.calls) == 2  # classifier (sentinel) + escalated answer
+    assert {r.model for r in resp.usage_records} == {"floor", "big"}
+
+
+async def test_classify_without_classifier_config_raises() -> None:
     config = _config()
     config["maslul"]["strategy"] = "classify"
     router = Router(config, providers={"fake": FakeProvider("fake")})
+    with pytest.raises(ConfigError):
+        await router.complete(_req())
+
+
+async def test_verify_cascade_deferred_to_m5() -> None:
+    config = _config()
+    config["maslul"]["strategy"] = "verify_cascade"
+    router = Router(config, providers={"fake": FakeProvider("fake")})
     with pytest.raises(NotImplementedError):
-        await router.complete(_req())  # no custom classifier → CLASSIFY not yet implemented
+        await router.complete(_req())
 
 
 async def test_missing_provider_raises_config_error() -> None:

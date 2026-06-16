@@ -252,3 +252,63 @@ async def test_grok_vision_live() -> None:
     from maslul.providers.grok import GrokProvider
 
     await _vision_round_trip("grok", GrokProvider(), os.getenv("MASLUL_GROK_MODEL", "grok-4.3"))
+
+
+# --- M4: classify strategies (live, Anthropic) -------------------------------------------
+# A cheap haiku classifier with a sonnet HARD tier — also a real two-model usage breakdown.
+
+_CLASSIFIER = "claude-haiku-4-5"
+_FAST = "claude-haiku-4-5"
+_HARD = "claude-sonnet-4-6"
+
+
+def _strategy_router(strategy: str) -> Router:
+    from maslul.providers.anthropic import AnthropicProvider
+
+    config = {
+        "maslul": {
+            "strategy": strategy,
+            "default_level": "hard",
+            "min_tokens_to_classify": 1,
+            "tiers": {
+                "simple": {"provider": "anthropic", "model": _FAST},
+                "medium": {"provider": "anthropic", "model": _FAST},
+                "hard": {"provider": "anthropic", "model": _HARD},
+            },
+            "classifier": {"provider": "anthropic", "model": _CLASSIFIER},
+        }
+    }
+    # Disable the hard-signal pre-stage so the LLM strategy itself is exercised (otherwise an
+    # intent verb like "prove" would short-circuit to HARD before the classifier is consulted).
+    return Router(
+        config,
+        providers={"anthropic": AnthropicProvider()},
+        hard_signal=lambda _req: False,
+    )
+
+
+@requires_anthropic
+async def test_anthropic_classify_strategy_live() -> None:
+    router = _strategy_router("classify")
+    resp = await router.complete(
+        Request(
+            messages=[Message(role="user", content="Prove there are infinitely many primes.")],
+            max_tokens=512,
+        )
+    )
+    assert resp.classification_usage is not None  # a separate classify call ran
+    assert resp.level_used is Level.HARD  # a proof is hard
+    assert {r.model for r in resp.usage_records} == {_CLASSIFIER, _HARD}  # per-model breakdown
+
+
+@requires_anthropic
+async def test_anthropic_classify_and_answer_live() -> None:
+    router = _strategy_router("classify_and_answer")
+    resp = await router.complete(
+        Request(
+            messages=[Message(role="user", content="What is 2 + 2? Reply with only the number.")],
+            max_tokens=512,
+        )
+    )
+    assert "4" in resp.text
+    assert resp.level_used is None  # the floor model answered inline (no escalation)
