@@ -344,3 +344,28 @@ async def test_anthropic_verify_cascade_live() -> None:
     assert resp.level_used is Level.HARD  # escalated to the most capable tier
     assert resp.model == _HARD
     assert {r.model for r in resp.usage_records} == {_FAST, _HARD}  # both attributed
+
+
+@requires_anthropic
+async def test_anthropic_web_search_live() -> None:
+    """Server-side web search: the turn pauses mid-search; maslul must resume it (not return a
+    truncated pause_turn) and surface the citations."""
+    from maslul.providers.anthropic import AnthropicProvider
+
+    model = os.getenv("MASLUL_ANTHROPIC_MODEL", "claude-sonnet-4-6")
+    router = _router("anthropic", AnthropicProvider(), model)
+    req = Request(
+        messages=[
+            Message(
+                role="user",
+                content="Use web search to find the current weather in Tokyo right now, "
+                "then answer in one short sentence.",
+            )
+        ],
+        server_tools=[{"type": "web_search_20250305", "name": "web_search", "max_uses": 3}],
+        max_tokens=1024,
+    )
+    resp = await router.complete(req, level=Level.HARD)
+    assert resp.text.strip()
+    assert resp.finish_reason != "pause_turn"  # the paused search turn was resumed, not truncated
+    assert resp.sources  # the web search surfaced citations

@@ -252,6 +252,63 @@ async def test_grok_tool_use_translation() -> None:
     assert tool_msgs and tool_msgs[0].tool_call_id == "c1"
 
 
+class _ScriptedAnthropic:
+    """Returns a scripted sequence of responses (for the pause_turn server-tool loop)."""
+
+    def __init__(self, responses: list[Any]) -> None:
+        self.calls: list[dict[str, Any]] = []
+        self._responses = list(responses)
+        self.messages = SimpleNamespace(create=self._create)
+
+    async def _create(self, **kwargs: Any) -> Any:
+        self.calls.append(kwargs)
+        return self._responses.pop(0)
+
+
+async def test_anthropic_resumes_server_tool_pause_and_collects_sources() -> None:
+    paused = SimpleNamespace(
+        content=[SimpleNamespace(type="server_tool_use", id="s1", name="web_search", input={})],
+        usage=SimpleNamespace(
+            input_tokens=5,
+            output_tokens=2,
+            cache_read_input_tokens=0,
+            cache_creation_input_tokens=0,
+        ),
+        stop_reason="pause_turn",
+    )
+    final = SimpleNamespace(
+        content=[
+            SimpleNamespace(
+                type="text",
+                text="~14M.",
+                citations=[SimpleNamespace(url="https://example.com/tokyo")],
+            )
+        ],
+        usage=SimpleNamespace(
+            input_tokens=6,
+            output_tokens=4,
+            cache_read_input_tokens=0,
+            cache_creation_input_tokens=0,
+        ),
+        stop_reason="end_turn",
+    )
+    fake = _ScriptedAnthropic([paused, final])
+    out = await AnthropicProvider(client=fake).complete(
+        ModelSpec(provider="anthropic", model="claude-sonnet-4-6"),
+        Request(
+            messages=[Message(role="user", content="population of Tokyo?")],
+            server_tools=[{"type": "web_search_20250305", "name": "web_search"}],
+        ),
+    )
+    assert out.text == "~14M."
+    assert out.sources == ["https://example.com/tokyo"]
+    assert out.finish_reason == "end_turn"
+    assert out.usage.output_tokens == 6  # 2 (paused) + 4 (final), accumulated across resume
+    assert len(fake.calls) == 2  # the paused turn was resumed
+    assert fake.calls[0]["tools"] == [{"type": "web_search_20250305", "name": "web_search"}]
+    assert fake.calls[1]["messages"][-1]["role"] == "assistant"  # raw content echoed back
+
+
 # --- structured output + vision translation (M3) -----------------------------------------
 # Assert each provider forwards response_format (json schema) and attaches media to the SDK
 # request. (The provider returns JSON text; Router decodes it into Response.structured.)

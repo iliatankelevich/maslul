@@ -124,6 +124,9 @@ class Request:
     system: list[str] | None = None
     tools: list[ToolDef] | None = None
     tool_executor: ToolExecutor | None = None
+    # Raw provider-native server-side tool specs (e.g. Anthropic web search) the provider runs
+    # itself — no client executor. Merged alongside ``tools``; unsupported providers ignore them.
+    server_tools: list[dict[str, Any]] | None = None
     response_format: JsonSchema | None = None
     media: list[MediaPart] | None = None
     max_tokens: int | None = None

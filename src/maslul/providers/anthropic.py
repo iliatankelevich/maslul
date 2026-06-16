@@ -22,6 +22,8 @@ from maslul.providers._common import last_user_index
 from maslul.types import MediaPart, Message, ModelSpec, Request, Response, ToolCall, Usage
 
 _DEFAULT_MAX_TOKENS = 1024
+# Guard against a runaway server-side-tool (web search) resume loop.
+_MAX_SERVER_TOOL_TURNS = 10
 
 
 class AnthropicProvider:
@@ -40,15 +42,17 @@ class AnthropicProvider:
         kwargs: dict[str, Any] = {
             "model": spec.model,
             "max_tokens": req.max_tokens or spec.max_tokens or _DEFAULT_MAX_TOKENS,
-            "messages": _to_messages(req.messages, req.media),
         }
+        # Client tools (router-executed) + raw server-side tools (web search, run by Anthropic).
+        tools = [
+            {"name": t.name, "description": t.description, "input_schema": t.input_schema}
+            for t in (req.tools or [])
+        ]
+        tools += list(req.server_tools or [])
+        if tools:
+            kwargs["tools"] = tools
         if req.system:
             kwargs["system"] = "\n\n".join(req.system)
-        if req.tools:
-            kwargs["tools"] = [
-                {"name": t.name, "description": t.description, "input_schema": t.input_schema}
-                for t in req.tools
-            ]
         if req.temperature is not None:
             kwargs["temperature"] = req.temperature
         if req.stop:
@@ -60,10 +64,23 @@ class AnthropicProvider:
             output_config = dict(kwargs.get("output_config") or {})
             output_config["format"] = {"type": "json_schema", "schema": req.response_format}
             kwargs["output_config"] = output_config
-        try:
-            resp = await self._client.messages.create(**kwargs)
-        except Exception as e:  # noqa: BLE001 - normalized to a MaslulError below
-            raise _map_error(e) from e
+
+        # Server-side tools (web search) pause the turn; resume by echoing the raw assistant
+        # content until a terminal stop reason. Usage accumulates across the resumed calls.
+        messages = _to_messages(req.messages, req.media)
+        usage = Usage()
+        turns = 0
+        while True:
+            try:
+                resp = await self._client.messages.create(messages=messages, **kwargs)
+            except Exception as e:  # noqa: BLE001 - normalized to a MaslulError below
+                raise _map_error(e) from e
+            _add_usage(usage, resp.usage)
+            turns += 1
+            paused = getattr(resp, "stop_reason", None) == "pause_turn"
+            if not paused or turns >= _MAX_SERVER_TOOL_TURNS:
+                break
+            messages = [*messages, {"role": "assistant", "content": resp.content}]
         text = "".join(b.text for b in resp.content if getattr(b, "type", None) == "text")
         tool_calls = [
             ToolCall(id=b.id, name=b.name, input=dict(b.input))
@@ -75,9 +92,10 @@ class AnthropicProvider:
             level_used=None,
             provider=self.name,
             model=spec.model,
-            usage=_usage(resp.usage),
+            usage=usage,
             tool_calls=tool_calls,
             finish_reason=getattr(resp, "stop_reason", None),
+            sources=_sources(resp.content),
             raw=resp,
         )
 
@@ -144,6 +162,27 @@ def _usage(u: Any) -> Usage:
         cache_read_input_tokens=getattr(u, "cache_read_input_tokens", 0) or 0,
         cache_creation_input_tokens=getattr(u, "cache_creation_input_tokens", 0) or 0,
     )
+
+
+def _add_usage(total: Usage, u: Any) -> None:
+    one = _usage(u)
+    total.input_tokens += one.input_tokens
+    total.output_tokens += one.output_tokens
+    total.cache_read_input_tokens += one.cache_read_input_tokens
+    total.cache_creation_input_tokens += one.cache_creation_input_tokens
+
+
+def _sources(content: Any) -> list[str]:
+    """Unique citation URLs from text blocks (server-side web search results)."""
+    urls: list[str] = []
+    for block in content or []:
+        if getattr(block, "type", None) != "text":
+            continue
+        for citation in getattr(block, "citations", None) or []:
+            url = getattr(citation, "url", None)
+            if url and url not in urls:
+                urls.append(url)
+    return urls
 
 
 def _map_error(e: Exception) -> Exception:
