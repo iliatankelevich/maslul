@@ -7,7 +7,12 @@ requires-python = ">=3.12"
 license = "MIT"
 license-files = ["LICENSE"]
 authors = [{ name = "Ilia Tankelevich" }]
-dependencies = []   # core is stdlib-only; provider SDKs land behind extras in M1
+dependencies = []   # core is stdlib-only; provider SDKs live behind the extras below
+
+[project.optional-dependencies]
+anthropic = ["anthropic>=0.109.1"]
+gemini = ["google-genai>=2.8.0"]
+grok = ["xai-sdk>=1.0.0"]
 
 [dependency-groups]
 dev = [
