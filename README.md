@@ -4,9 +4,10 @@
 
 # maslul
 
-**One async, fully-typed call across Anthropic, Gemini, and xAI Grok — that routes each request
-to the right model tier by difficulty.** Stop hardcoding model choices and stop re-writing the
-tool-use / structured-output / retry plumbing for every provider.
+**Smart LLM router — one call, the right model.** Async and fully typed, across Anthropic,
+Gemini, and xAI Grok — routing each request to the right model tier by difficulty. Stop
+hardcoding model choices and stop re-writing the tool-use / structured-output / retry plumbing
+for every provider.
 
 `maslul` (Hebrew *מסלול*, "route / lane") is a small library that does exactly two things:
 **routing** (pick a model tier per request, or pin one) and **provider normalization** (one

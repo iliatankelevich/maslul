@@ -1,7 +1,7 @@
 [project]
 name = "maslul"
 version = "0.1.0"
-description = "Async, fully-typed LLM router — one call across Anthropic, Gemini, and Grok, routed to the right model tier by difficulty."
+description = "Smart LLM router — one call, the right model."
 readme = "README.md"
 requires-python = ">=3.12"
 license = "MIT"
