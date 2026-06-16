@@ -151,8 +151,10 @@ _CITY_SCHEMA = {
 }
 
 
-def _solid_png(rgb: tuple[int, int, int], size: int = 8) -> bytes:
-    """A valid solid-color RGB PNG, built with stdlib only (no Pillow) for the vision test."""
+def _solid_png(rgb: tuple[int, int, int], size: int = 32) -> bytes:
+    """A valid solid-color RGB PNG, built with stdlib only (no Pillow) for the vision test.
+
+    32x32 (1024px) clears xAI's 512-pixel minimum; Anthropic/Gemini accept smaller too."""
     import struct
     import zlib
 
