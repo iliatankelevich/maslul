@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from maslul.errors import MaslulError, RateLimited
 from maslul.types import ModelSpec, Request, Response, Usage
 
 
@@ -46,6 +47,32 @@ class ScriptedProvider:
     async def complete(self, spec: ModelSpec, req: Request) -> Response:
         self.requests.append(req)
         return self._responses.pop(0)
+
+    async def healthcheck(self, spec: ModelSpec) -> None:
+        return None
+
+
+class FlakyProvider:
+    """Raises ``error`` for the first ``fails`` calls, then returns a normal reply. With
+    ``fails`` large it never succeeds — used to drive retry and fallback paths."""
+
+    def __init__(self, name: str, *, fails: int, error: MaslulError | None = None) -> None:
+        self.name = name
+        self._fails = fails
+        self._error = error or RateLimited("simulated rate limit")
+        self.attempts = 0
+
+    async def complete(self, spec: ModelSpec, req: Request) -> Response:
+        self.attempts += 1
+        if self.attempts <= self._fails:
+            raise self._error
+        return Response(
+            text="recovered",
+            level_used=None,
+            provider=spec.provider,
+            model=spec.model,
+            usage=Usage(input_tokens=1, output_tokens=1),
+        )
 
     async def healthcheck(self, spec: ModelSpec) -> None:
         return None

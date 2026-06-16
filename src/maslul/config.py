@@ -28,6 +28,12 @@ class RouterConfig:
     classifier: ModelSpec | None = None
     min_tokens_to_classify: int = 40
     providers: dict[str, dict[str, Any]] = field(default_factory=dict)
+    # Resilience (M5): per-call timeout, retry+backoff on transient errors, tier fallback.
+    request_timeout: float | None = None
+    max_retries: int = 2
+    retry_base_delay: float = 0.5
+    retry_max_delay: float = 8.0
+    fallback: bool = True
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> RouterConfig:
@@ -52,6 +58,7 @@ class RouterConfig:
         classifier_raw = root.get("classifier")
         classifier = _model_spec(classifier_raw) if classifier_raw else None
 
+        timeout = root.get("request_timeout")
         return cls(
             strategy=strategy,
             default_level=default_level,
@@ -59,6 +66,11 @@ class RouterConfig:
             classifier=classifier,
             min_tokens_to_classify=min_tokens,
             providers=dict(root.get("providers", {})),
+            request_timeout=float(timeout) if timeout is not None else None,
+            max_retries=int(root.get("max_retries", 2)),
+            retry_base_delay=float(root.get("retry_base_delay", 0.5)),
+            retry_max_delay=float(root.get("retry_max_delay", 8.0)),
+            fallback=bool(root.get("fallback", True)),
         )
 
     @classmethod

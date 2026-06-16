@@ -20,23 +20,26 @@ response's per-model usage breakdown.
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import hashlib
 import inspect
 import json
 import os
+import random
 import re
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import replace
 from typing import Any
 
 from maslul.config import RouterConfig
-from maslul.errors import ConfigError, ProviderError
+from maslul.errors import AuthError, ConfigError, MaslulError, ProviderError, RateLimited, Timeout
 from maslul.providers import Provider, build_provider
 from maslul.types import (
     BypassPredicate,
     Classifier,
     CompleteHook,
+    ErrorHook,
     HardSignal,
     Level,
     Message,
@@ -105,6 +108,7 @@ class Router:
         classifier: Classifier | None = None,
         on_route: RouteHook | None = None,
         on_complete: CompleteHook | None = None,
+        on_error: ErrorHook | None = None,
     ) -> None:
         self._config = (
             config if isinstance(config, RouterConfig) else RouterConfig.from_dict(config)
@@ -120,6 +124,7 @@ class Router:
         self._classifier = classifier
         self._on_route: list[RouteHook] = [on_route] if on_route else []
         self._on_complete: list[CompleteHook] = [on_complete] if on_complete else []
+        self._on_error: list[ErrorHook] = [on_error] if on_error else []
         self._classify_cache: dict[str, Level] = {}
 
     @classmethod
@@ -140,6 +145,10 @@ class Router:
     def on_complete(self, callback: CompleteHook) -> None:
         """Register a callback fired with the final :class:`Response` (incl. usage_records)."""
         self._on_complete.append(callback)
+
+    def on_error(self, callback: ErrorHook) -> None:
+        """Register a callback fired on each failed model attempt (retry or fallback)."""
+        self._on_error.append(callback)
 
     @property
     def config(self) -> RouterConfig:
@@ -166,7 +175,7 @@ class Router:
         if prepared is not None:  # CLASSIFY_AND_ANSWER answered inline
             resp = self._finalize(req, prepared, _ledger_of(prepared))
         else:
-            resp = await self._execute(decision.spec, req, decision.classification)
+            resp = await self._execute(decision.spec, decision.level, req, decision.classification)
         resp.level_used = decision.level
         for cb in self._on_complete:
             cb(resp)
@@ -261,10 +270,40 @@ class Router:
         return RoutingDecision(spec, None, "classify_and_answer:answered"), resp
 
     async def _execute(
-        self, spec: ModelSpec, req: Request, classification: ModelUsage | None = None
+        self,
+        spec: ModelSpec,
+        level: Level | None,
+        req: Request,
+        classification: ModelUsage | None = None,
     ) -> Response:
-        """Run the model (with the tool loop when tools are present), decode structured output,
-        and attach the per-model usage breakdown (seeded with any prior classify call)."""
+        """Run the answer with resilience: try the model (retrying transient errors), and on
+        persistent failure fall back to the next-higher tier. ``AuthError`` never retries or
+        falls back — it's a configuration problem."""
+        last: MaslulError | None = None
+        for fallback_spec in self._fallback_chain(spec, level):
+            for attempt in range(self._config.max_retries + 1):
+                try:
+                    return await self._execute_once(fallback_spec, req, classification)
+                except AuthError:
+                    raise
+                except (RateLimited, Timeout) as e:  # transient → retry this model, then fall back
+                    last = e
+                    for cb in self._on_error:
+                        cb(req, fallback_spec, e)
+                    if attempt < self._config.max_retries:
+                        await self._sleep_backoff(attempt)
+                        continue
+                    break
+                except ProviderError as e:  # not retryable here → fall back to the next model
+                    last = e
+                    for cb in self._on_error:
+                        cb(req, fallback_spec, e)
+                    break
+        raise last if last is not None else ProviderError("no model available to execute request")
+
+    async def _execute_once(
+        self, spec: ModelSpec, req: Request, classification: ModelUsage | None
+    ) -> Response:
         provider = self._provider_for(spec)
         ledger: dict[tuple[str, str], Usage] = {}
         if classification is not None:
@@ -272,11 +311,39 @@ class Router:
                 ledger, classification.provider, classification.model, classification.usage
             )
         if not req.tools or req.tool_executor is None:
-            resp = await provider.complete(spec, req)
+            resp = await self._invoke(provider, spec, req)
             _record(ledger, resp)
         else:
             resp = await self._run_tool_loop(spec, provider, req, ledger)
         return self._finalize(req, resp, ledger, classification)
+
+    async def _invoke(self, provider: Provider, spec: ModelSpec, req: Request) -> Response:
+        """One provider call, bounded by the per-call timeout (mapped to a retryable Timeout)."""
+        if self._config.request_timeout is None:
+            return await provider.complete(spec, req)
+        try:
+            return await asyncio.wait_for(
+                provider.complete(spec, req), self._config.request_timeout
+            )
+        except TimeoutError as e:
+            raise Timeout(f"provider call exceeded {self._config.request_timeout}s") from e
+
+    async def _sleep_backoff(self, attempt: int) -> None:
+        base = self._config.retry_base_delay
+        delay = min(self._config.retry_max_delay, base * (2**attempt))
+        await asyncio.sleep(delay + random.uniform(0, delay))  # full jitter
+
+    def _fallback_chain(self, spec: ModelSpec, level: Level | None) -> Sequence[ModelSpec]:
+        """The primary spec, then (when fallback is enabled and a tier was chosen) each
+        higher tier — which may be a different provider, giving cross-provider resilience."""
+        chain = [spec]
+        if self._config.fallback and level is not None:
+            for higher in Level:
+                if higher > level:
+                    tier = self._config.tiers.get(higher)
+                    if tier is not None and tier not in chain:
+                        chain.append(tier)
+        return chain
 
     def _finalize(
         self,
@@ -303,7 +370,7 @@ class Router:
         messages = list(req.messages)
         executed: list[ToolCall] = []
         for _ in range(_MAX_TOOL_ITERATIONS):
-            resp = await provider.complete(spec, replace(req, messages=messages))
+            resp = await self._invoke(provider, spec, replace(req, messages=messages))
             _record(ledger, resp)
             if not resp.tool_calls:
                 resp.tool_calls = executed  # surface the full tool I/O of the turn

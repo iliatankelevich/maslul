@@ -5,11 +5,13 @@ from typing import Any
 import pytest
 
 from maslul import (
+    AuthError,
     ConfigError,
     Level,
     Message,
     ModelSpec,
     ModelUsage,
+    RateLimited,
     Request,
     Response,
     Router,
@@ -19,7 +21,7 @@ from maslul import (
     ToolDef,
     Usage,
 )
-from tests.fakes import FakeProvider, ScriptedProvider
+from tests.fakes import FakeProvider, FlakyProvider, ScriptedProvider
 
 
 def _config() -> dict[str, Any]:
@@ -335,3 +337,64 @@ async def test_tool_loop_raises_when_iterations_exhausted() -> None:
     )
     with pytest.raises(ProviderError):
         await router.complete(req, level=Level.SIMPLE)
+
+
+# --- resilience (M5) ---------------------------------------------------------------------
+
+
+async def test_transient_error_is_retried_then_succeeds() -> None:
+    flaky = FlakyProvider("fake", fails=2)  # two RateLimited, then a real reply
+    config = _config()
+    config["maslul"]["max_retries"] = 2
+    config["maslul"]["retry_base_delay"] = 0  # no real sleeping in tests
+    router = Router(config, providers={"fake": flaky})
+    resp = await router.complete(_req(), level=Level.SIMPLE)
+    assert resp.text == "recovered"
+    assert flaky.attempts == 3
+
+
+async def test_falls_back_to_higher_tier_on_persistent_failure() -> None:
+    flaky = FlakyProvider("flaky", fails=99)  # never recovers
+    stable = FakeProvider("stable", text="from the hard tier")
+    config = {
+        "maslul": {
+            "strategy": "route_default",
+            "default_level": "simple",
+            "max_retries": 0,
+            "retry_base_delay": 0,
+            "tiers": {
+                "simple": {"provider": "flaky", "model": "small"},
+                "hard": {"provider": "stable", "model": "big"},
+            },
+        }
+    }
+    router = Router(config, providers={"flaky": flaky, "stable": stable})
+    resp = await router.complete(_req())  # SIMPLE fails → fall back to the HARD tier
+    assert resp.text == "from the hard tier"
+    assert resp.provider == "stable"
+
+
+async def test_auth_error_is_not_retried_or_fallen_back() -> None:
+    flaky = FlakyProvider("fake", fails=99, error=AuthError("bad key"))
+    config = _config()
+    config["maslul"]["max_retries"] = 3
+    router = Router(config, providers={"fake": flaky})
+    with pytest.raises(AuthError):
+        await router.complete(_req(), level=Level.SIMPLE)
+    assert flaky.attempts == 1  # config problem → fail fast, no retry/fallback
+
+
+async def test_on_error_fires_per_failed_attempt() -> None:
+    flaky = FlakyProvider("fake", fails=2)
+    errors: list[Exception] = []
+    config = _config()
+    config["maslul"]["max_retries"] = 2
+    config["maslul"]["retry_base_delay"] = 0
+    router = Router(
+        config,
+        providers={"fake": flaky},
+        on_error=lambda _req, _spec, exc: errors.append(exc),
+    )
+    await router.complete(_req(), level=Level.SIMPLE)
+    assert len(errors) == 2  # two transient failures before the success
+    assert all(isinstance(e, RateLimited) for e in errors)

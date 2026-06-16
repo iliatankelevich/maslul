@@ -12,7 +12,7 @@ from dataclasses import dataclass, field
 from enum import IntEnum, StrEnum
 from typing import Any, Literal
 
-from maslul.errors import ConfigError
+from maslul.errors import ConfigError, MaslulError
 
 #: Provider names Maslul knows how to dispatch to. The ``provider`` prefix of a
 #: ``"provider:model"`` spec must be one of these.
@@ -189,6 +189,10 @@ Classifier = Callable[[Request], "Level | None | Awaitable[Level | None]"]
 BypassPredicate = Callable[[Request], "Level | None"]
 #: UP-only escalation signal: True routes the request to HARD without a classifier call.
 HardSignal = Callable[[Request], bool]
+#: Decides whether a cheap answer is good enough; False triggers escalation (VERIFY_CASCADE).
+Verifier = Callable[[Request, Response], bool | Awaitable[bool]]
 #: Observability hooks.
 RouteHook = Callable[[Request, RoutingDecision], None]
 CompleteHook = Callable[[Response], None]
+#: Fired on each failed model attempt (a retry or a fallback to another model).
+ErrorHook = Callable[[Request, ModelSpec, MaslulError], None]
