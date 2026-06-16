@@ -1,10 +1,12 @@
 <p align="center">
-  <img src="docs/assets/maslul-logo.png" alt="maslul" width="420">
+  <img src="docs/assets/maslul-logo.png" alt="maslul" width="700">
 </p>
 
 # maslul
 
-**Smart LLM router — one call, the right model.** Async and fully typed, across Anthropic,
+**Smart LLM router — one call, the right model.**
+
+Async and fully typed, across Anthropic,
 Gemini, and xAI Grok — routing each request to the right model tier by difficulty. Stop
 hardcoding model choices and stop re-writing the tool-use / structured-output / retry plumbing
 for every provider.
