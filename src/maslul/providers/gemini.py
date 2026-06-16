@@ -16,6 +16,7 @@ from google import genai
 from google.genai import types
 
 from maslul.errors import ProviderError
+from maslul.providers._common import last_user_index
 from maslul.types import ModelSpec, Request, Response, ToolCall, Usage
 
 
@@ -54,6 +55,9 @@ class GeminiProvider:
             config["temperature"] = req.temperature
         if req.stop:
             config["stop_sequences"] = req.stop
+        if req.response_format is not None:
+            config["response_mime_type"] = "application/json"
+            config["response_json_schema"] = req.response_format
         if req.tools:
             config["tools"] = [
                 types.Tool(
@@ -91,8 +95,9 @@ class GeminiProvider:
 
 
 def _contents(req: Request) -> list[Any]:
+    media_at = last_user_index(req.messages) if req.media else -1
     out: list[Any] = []
-    for m in req.messages:
+    for i, m in enumerate(req.messages):
         if m.role == "tool":
             out.append(
                 types.Content(
@@ -114,11 +119,13 @@ def _contents(req: Request) -> list[Any]:
             ]
             out.append(types.Content(role="model", parts=parts))
         else:
+            parts = [types.Part.from_text(text=m.content)] if m.content else []
+            if i == media_at and req.media:
+                parts += [
+                    types.Part.from_bytes(data=p.data, mime_type=p.mime_type) for p in req.media
+                ]
             out.append(
-                types.Content(
-                    role="model" if m.role == "assistant" else "user",
-                    parts=[types.Part.from_text(text=m.content)],
-                )
+                types.Content(role="model" if m.role == "assistant" else "user", parts=parts)
             )
     return out
 

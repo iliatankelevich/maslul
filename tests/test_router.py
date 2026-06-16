@@ -137,6 +137,28 @@ async def test_tool_loop_runs_tool_feeds_result_back_and_terminates() -> None:
     assert any(m.role == "tool" and m.content == "5" and m.tool_call_id == "c1" for m in second)
 
 
+async def test_response_format_parses_text_into_structured() -> None:
+    provider = ScriptedProvider(
+        "fake",
+        [
+            Response(
+                text='{"city": "Paris", "country": "France"}',
+                level_used=None,
+                provider="fake",
+                model="small",
+                usage=Usage(),
+            )
+        ],
+    )
+    router = Router(_config(), providers={"fake": provider})
+    req = Request(
+        messages=[Message(role="user", content="extract")],
+        response_format={"type": "object"},
+    )
+    resp = await router.complete(req, level=Level.SIMPLE)
+    assert resp.structured == {"city": "Paris", "country": "France"}
+
+
 async def test_tool_loop_raises_when_iterations_exhausted() -> None:
     from maslul import ProviderError
 

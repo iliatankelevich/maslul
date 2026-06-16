@@ -14,15 +14,17 @@ Importing this module requires the ``grok`` extra (``pip install maslul[grok]``)
 
 from __future__ import annotations
 
+import base64
 import json
 from typing import Any
 
 import grpc
 from xai_sdk import AsyncClient
-from xai_sdk.chat import assistant, chat_pb2, system, tool, tool_result, user
+from xai_sdk.chat import assistant, chat_pb2, image, system, tool, tool_result, user
 
 from maslul.errors import AuthError, ProviderError, RateLimited, Timeout
-from maslul.types import Message, ModelSpec, Request, Response, ToolCall, Usage
+from maslul.providers._common import last_user_index
+from maslul.types import MediaPart, Message, ModelSpec, Request, Response, ToolCall, Usage
 
 
 class GrokProvider:
@@ -34,13 +36,18 @@ class GrokProvider:
         self._client: Any = client or (AsyncClient(api_key=api_key) if api_key else AsyncClient())
 
     async def complete(self, spec: ModelSpec, req: Request) -> Response:
-        messages = [system(s) for s in (req.system or [])] + _to_messages(req.messages)
+        messages = [system(s) for s in (req.system or [])] + _to_messages(req.messages, req.media)
         kwargs: dict[str, Any] = {"model": spec.model, "messages": messages}
         if req.tools:
             kwargs["tools"] = [
                 tool(name=t.name, description=t.description, parameters=t.input_schema)
                 for t in req.tools
             ]
+        if req.response_format is not None:
+            kwargs["response_format"] = chat_pb2.ResponseFormat(
+                format_type=chat_pb2.FormatType.FORMAT_TYPE_JSON_SCHEMA,
+                schema=json.dumps(req.response_format),
+            )
         max_tokens = req.max_tokens or spec.max_tokens
         if max_tokens:
             kwargs["max_tokens"] = max_tokens
@@ -67,9 +74,10 @@ class GrokProvider:
         await chat.sample()
 
 
-def _to_messages(messages: list[Message]) -> list[Any]:
+def _to_messages(messages: list[Message], media: list[MediaPart] | None) -> list[Any]:
+    media_at = last_user_index(messages) if media else -1
     out: list[Any] = []
-    for m in messages:
+    for i, m in enumerate(messages):
         if m.role == "tool":
             out.append(tool_result(m.content, tool_call_id=m.tool_call_id))
         elif m.role == "assistant" and m.tool_calls:
@@ -87,9 +95,17 @@ def _to_messages(messages: list[Message]) -> list[Any]:
             out.append(msg)
         elif m.role == "assistant":
             out.append(assistant(m.content))
+        elif i == media_at and media:
+            args: list[Any] = [m.content] if m.content else []
+            args += [image(_data_url(p)) for p in media]
+            out.append(user(*args))
         else:
             out.append(user(m.content))
     return out
+
+
+def _data_url(part: MediaPart) -> str:
+    return f"data:{part.mime_type};base64,{base64.standard_b64encode(part.data).decode()}"
 
 
 def _tool_calls(resp: Any) -> list[ToolCall]:

@@ -11,13 +11,15 @@ Importing this module requires the ``anthropic`` extra (``pip install maslul[ant
 
 from __future__ import annotations
 
+import base64
 from typing import Any
 
 import anthropic
 from anthropic import AsyncAnthropic
 
 from maslul.errors import AuthError, ProviderError, RateLimited, Timeout
-from maslul.types import Message, ModelSpec, Request, Response, ToolCall, Usage
+from maslul.providers._common import last_user_index
+from maslul.types import MediaPart, Message, ModelSpec, Request, Response, ToolCall, Usage
 
 _DEFAULT_MAX_TOKENS = 1024
 
@@ -38,7 +40,7 @@ class AnthropicProvider:
         kwargs: dict[str, Any] = {
             "model": spec.model,
             "max_tokens": req.max_tokens or spec.max_tokens or _DEFAULT_MAX_TOKENS,
-            "messages": _to_messages(req.messages),
+            "messages": _to_messages(req.messages, req.media),
         }
         if req.system:
             kwargs["system"] = "\n\n".join(req.system)
@@ -53,6 +55,11 @@ class AnthropicProvider:
             kwargs["stop_sequences"] = req.stop
         kwargs.update(spec.options)
         kwargs.update(req.provider_options)
+        if req.response_format is not None:
+            # merge into output_config so it coexists with effort/thinking from provider_options
+            output_config = dict(kwargs.get("output_config") or {})
+            output_config["format"] = {"type": "json_schema", "schema": req.response_format}
+            kwargs["output_config"] = output_config
         try:
             resp = await self._client.messages.create(**kwargs)
         except Exception as e:  # noqa: BLE001 - normalized to a MaslulError below
@@ -82,9 +89,11 @@ class AnthropicProvider:
         )
 
 
-def _to_messages(messages: list[Message]) -> list[dict[str, Any]]:
+def _to_messages(messages: list[Message], media: list[MediaPart] | None) -> list[dict[str, Any]]:
     """Normalized messages → Anthropic's shape. Consecutive ``tool`` results collapse into a
-    single ``user`` message of ``tool_result`` blocks (the API expects them grouped)."""
+    single ``user`` message of ``tool_result`` blocks (the API expects them grouped). Any
+    ``media`` is attached to the last user message as image/document blocks."""
+    media_at = last_user_index(messages) if media else -1
     out: list[dict[str, Any]] = []
     pending: list[dict[str, Any]] = []
 
@@ -93,7 +102,7 @@ def _to_messages(messages: list[Message]) -> list[dict[str, Any]]:
             out.append({"role": "user", "content": list(pending)})
             pending.clear()
 
-    for m in messages:
+    for i, m in enumerate(messages):
         if m.role == "tool":
             pending.append(
                 {"type": "tool_result", "tool_use_id": m.tool_call_id, "content": m.content}
@@ -109,10 +118,23 @@ def _to_messages(messages: list[Message]) -> list[dict[str, Any]]:
                 for tc in m.tool_calls
             ]
             out.append({"role": "assistant", "content": content})
+        elif i == media_at and media:
+            blocks: list[dict[str, Any]] = []
+            if m.content:
+                blocks.append({"type": "text", "text": m.content})
+            blocks += [_media_block(p) for p in media]
+            out.append({"role": "user", "content": blocks})
         else:
             out.append({"role": m.role, "content": m.content})
     flush()
     return out
+
+
+def _media_block(part: MediaPart) -> dict[str, Any]:
+    """A base64 image/document content block. PDFs use a ``document`` block; images, ``image``."""
+    b64 = base64.standard_b64encode(part.data).decode()
+    kind = "document" if part.mime_type == "application/pdf" else "image"
+    return {"type": kind, "source": {"type": "base64", "media_type": part.mime_type, "data": b64}}
 
 
 def _usage(u: Any) -> Usage:

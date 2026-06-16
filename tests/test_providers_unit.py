@@ -5,17 +5,19 @@ real message-builder + response-mapping code in each provider; only the transpor
 
 from __future__ import annotations
 
+import json
 from types import SimpleNamespace
 from typing import Any
 
 import pytest
+from xai_sdk.chat import chat_pb2
 
 from maslul.errors import ConfigError
 from maslul.providers import build_provider
 from maslul.providers.anthropic import AnthropicProvider
 from maslul.providers.gemini import GeminiProvider
 from maslul.providers.grok import GrokProvider
-from maslul.types import Message, ModelSpec, Request, ToolCall, ToolDef
+from maslul.types import MediaPart, Message, ModelSpec, Request, ToolCall, ToolDef
 
 
 def _req() -> Request:
@@ -248,3 +250,82 @@ async def test_grok_tool_use_translation() -> None:
     assert assistant_msgs and assistant_msgs[0].tool_calls[0].function.name == "add"
     tool_msgs = [m for m in sent if getattr(m, "tool_call_id", "")]
     assert tool_msgs and tool_msgs[0].tool_call_id == "c1"
+
+
+# --- structured output + vision translation (M3) -----------------------------------------
+# Assert each provider forwards response_format (json schema) and attaches media to the SDK
+# request. (The provider returns JSON text; Router decodes it into Response.structured.)
+
+_SCHEMA = {
+    "type": "object",
+    "properties": {"ok": {"type": "boolean"}},
+    "required": ["ok"],
+    "additionalProperties": False,
+}
+
+
+def _vision_req() -> Request:
+    return Request(
+        messages=[Message(role="user", content="is it ok?")],
+        response_format=_SCHEMA,
+        media=[MediaPart(mime_type="image/png", data=b"\x89PNGfake")],
+    )
+
+
+async def test_anthropic_structured_and_media_translation() -> None:
+    resp = SimpleNamespace(
+        content=[SimpleNamespace(type="text", text='{"ok": true}')],
+        usage=SimpleNamespace(
+            input_tokens=1,
+            output_tokens=1,
+            cache_read_input_tokens=0,
+            cache_creation_input_tokens=0,
+        ),
+        stop_reason="end_turn",
+    )
+    fake = _FakeAnthropic(resp)
+    await AnthropicProvider(client=fake).complete(
+        ModelSpec(provider="anthropic", model="claude-haiku-4-5"), _vision_req()
+    )
+    sent = fake.calls[0]
+    assert sent["output_config"]["format"] == {"type": "json_schema", "schema": _SCHEMA}
+    user_content = sent["messages"][0]["content"]
+    assert any(b.get("type") == "image" for b in user_content)
+
+
+async def test_gemini_structured_and_media_translation() -> None:
+    resp = SimpleNamespace(
+        text='{"ok": true}',
+        usage_metadata=SimpleNamespace(
+            prompt_token_count=1, candidates_token_count=1, cached_content_token_count=0
+        ),
+        candidates=[SimpleNamespace(finish_reason=SimpleNamespace(name="STOP"))],
+    )
+    fake = _FakeGemini(resp)
+    await GeminiProvider(client=fake).complete(
+        ModelSpec(provider="gemini", model="gemini-2.5-flash"), _vision_req()
+    )
+    cfg = fake.calls[0]["config"]
+    assert cfg.response_mime_type == "application/json"
+    assert cfg.response_json_schema == _SCHEMA
+    parts = fake.calls[0]["contents"][0].parts
+    assert any(getattr(p, "inline_data", None) is not None for p in parts)
+
+
+async def test_grok_structured_and_media_translation() -> None:
+    resp = SimpleNamespace(
+        content='{"ok": true}',
+        tool_calls=[],
+        usage=SimpleNamespace(prompt_tokens=1, completion_tokens=1, cached_prompt_text_tokens=0),
+        finish_reason="stop",
+    )
+    fake = _FakeGrok(resp)
+    await GrokProvider(client=fake).complete(
+        ModelSpec(provider="grok", model="grok-4.3"), _vision_req()
+    )
+    kwargs = fake.calls[0]
+    rf = kwargs["response_format"]
+    assert rf.format_type == chat_pb2.FormatType.FORMAT_TYPE_JSON_SCHEMA
+    assert json.loads(rf.schema) == _SCHEMA
+    user_msg = kwargs["messages"][-1]
+    assert any(c.HasField("image_url") for c in user_msg.content)

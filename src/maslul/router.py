@@ -4,6 +4,8 @@
 
 from __future__ import annotations
 
+import contextlib
+import json
 import os
 from collections.abc import Mapping
 from dataclasses import replace
@@ -81,6 +83,7 @@ class Router:
         if not req.tools or req.tool_executor is None:
             resp = await provider.complete(spec, req)
             resp.level_used = level
+            _apply_structured(req, resp)
             return resp
         return await self._run_tool_loop(spec, provider, req, level)
 
@@ -98,6 +101,7 @@ class Router:
                 resp.usage = total
                 resp.tool_calls = executed  # surface the full tool I/O of the turn
                 resp.level_used = level
+                _apply_structured(req, resp)
                 return resp
             messages.append(
                 Message(role="assistant", content=resp.text, tool_calls=resp.tool_calls)
@@ -131,3 +135,13 @@ def _accumulate(total: Usage, u: Usage) -> None:
     total.output_tokens += u.output_tokens
     total.cache_read_input_tokens += u.cache_read_input_tokens
     total.cache_creation_input_tokens += u.cache_creation_input_tokens
+
+
+def _apply_structured(req: Request, resp: Response) -> None:
+    """When ``response_format`` was requested, parse the JSON answer into ``Response.structured``.
+    The provider already constrained the model to emit JSON; here we just decode the text. A
+    parse failure (e.g. a refusal) leaves ``structured`` as ``None`` for the caller to handle."""
+    if req.response_format is None or resp.structured is not None or not resp.text:
+        return
+    with contextlib.suppress(ValueError, TypeError):
+        resp.structured = json.loads(resp.text)
