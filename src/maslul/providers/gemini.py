@@ -15,7 +15,7 @@ from typing import Any
 from google import genai
 from google.genai import types
 
-from maslul.errors import ProviderError
+from maslul.errors import AuthError, ProviderError, RateLimited, Timeout
 from maslul.providers._common import last_user_index
 from maslul.types import ModelSpec, Request, Response, ToolCall, Usage
 
@@ -78,7 +78,7 @@ class GeminiProvider:
                 config=types.GenerateContentConfig(**config) if config else None,
             )
         except Exception as e:  # noqa: BLE001 - normalized below
-            raise ProviderError(str(e)) from e
+            raise _map_error(e) from e
         return Response(
             text=_text(resp),
             level_used=None,
@@ -163,3 +163,16 @@ def _finish_reason(resp: Any) -> str | None:
     if fr is None:
         return None
     return getattr(fr, "name", None) or str(fr)
+
+
+def _map_error(e: Exception) -> Exception:
+    """Map a google-genai ``APIError`` to the :class:`~maslul.MaslulError` hierarchy by HTTP
+    status code (``e.code``); anything without a recognized code becomes a ``ProviderError``."""
+    code = getattr(e, "code", None)
+    if code == 429:
+        return RateLimited(str(e))
+    if code == 408:
+        return Timeout(str(e))
+    if code in (401, 403):
+        return AuthError(str(e))
+    return ProviderError(str(e))
