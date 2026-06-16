@@ -29,3 +29,23 @@ class FakeProvider:
 
     async def healthcheck(self, spec: ModelSpec) -> None:
         return None
+
+
+class ScriptedProvider:
+    """Returns a pre-scripted sequence of Responses, recording each Request it received.
+
+    Used to drive the router's tool-use loop deterministically: e.g. a tool-call response
+    followed by a final text response.
+    """
+
+    def __init__(self, name: str, responses: list[Response]) -> None:
+        self.name = name
+        self._responses = list(responses)
+        self.requests: list[Request] = []
+
+    async def complete(self, spec: ModelSpec, req: Request) -> Response:
+        self.requests.append(req)
+        return self._responses.pop(0)
+
+    async def healthcheck(self, spec: ModelSpec) -> None:
+        return None

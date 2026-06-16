@@ -15,7 +15,7 @@ from maslul.providers import build_provider
 from maslul.providers.anthropic import AnthropicProvider
 from maslul.providers.gemini import GeminiProvider
 from maslul.providers.grok import GrokProvider
-from maslul.types import Message, ModelSpec, Request
+from maslul.types import Message, ModelSpec, Request, ToolCall, ToolDef
 
 
 def _req() -> Request:
@@ -152,3 +152,99 @@ async def test_build_provider_dispatches_by_name(monkeypatch: pytest.MonkeyPatch
 def test_build_provider_unknown_raises() -> None:
     with pytest.raises(ConfigError):
         build_provider("openai", {})
+
+
+# --- tool-use translation (M2) -----------------------------------------------------------
+# Each asserts both directions: parsing a tool-call response into Response.tool_calls, and
+# translating an assistant tool-call turn + tool result back into the SDK's shape.
+
+_TOOL = ToolDef(name="add", description="add", input_schema={"type": "object"})
+_HISTORY = [
+    Message(role="user", content="2+3?"),
+    Message(role="assistant", tool_calls=[ToolCall(id="c1", name="add", input={"a": 2, "b": 3})]),
+    Message(role="tool", content="5", tool_call_id="c1", name="add"),
+]
+
+
+async def test_anthropic_tool_use_translation() -> None:
+    resp = SimpleNamespace(
+        content=[SimpleNamespace(type="tool_use", id="c1", name="add", input={"a": 2, "b": 3})],
+        usage=SimpleNamespace(
+            input_tokens=1,
+            output_tokens=1,
+            cache_read_input_tokens=0,
+            cache_creation_input_tokens=0,
+        ),
+        stop_reason="tool_use",
+    )
+    fake = _FakeAnthropic(resp)
+    provider = AnthropicProvider(client=fake)
+    spec = ModelSpec(provider="anthropic", model="claude-haiku-4-5")
+
+    out = await provider.complete(
+        spec, Request(messages=[Message(role="user", content="2+3?")], tools=[_TOOL])
+    )
+    assert [(c.id, c.name, c.input) for c in out.tool_calls] == [("c1", "add", {"a": 2, "b": 3})]
+    assert fake.calls[0]["tools"][0]["name"] == "add"
+
+    await provider.complete(spec, Request(messages=_HISTORY))
+    sent = fake.calls[1]["messages"]
+    assert sent[1]["role"] == "assistant" and sent[1]["content"][0]["type"] == "tool_use"
+    assert sent[2] == {
+        "role": "user",
+        "content": [{"type": "tool_result", "tool_use_id": "c1", "content": "5"}],
+    }
+
+
+async def test_gemini_tool_use_translation() -> None:
+    resp = SimpleNamespace(
+        text=None,
+        function_calls=[SimpleNamespace(name="add", args={"a": 2, "b": 3})],
+        usage_metadata=SimpleNamespace(
+            prompt_token_count=1, candidates_token_count=1, cached_content_token_count=0
+        ),
+        candidates=[SimpleNamespace(finish_reason=SimpleNamespace(name="STOP"))],
+    )
+    fake = _FakeGemini(resp)
+    provider = GeminiProvider(client=fake)
+    spec = ModelSpec(provider="gemini", model="gemini-2.5-flash")
+
+    out = await provider.complete(
+        spec, Request(messages=[Message(role="user", content="2+3?")], tools=[_TOOL])
+    )
+    assert [(c.name, c.input) for c in out.tool_calls] == [("add", {"a": 2, "b": 3})]
+    assert fake.calls[0]["config"].tools[0].function_declarations[0].name == "add"
+
+    await provider.complete(spec, Request(messages=_HISTORY))
+    contents = fake.calls[1]["contents"]
+    assert contents[1].role == "model" and contents[1].parts[0].function_call.name == "add"
+    assert contents[2].role == "tool" and contents[2].parts[0].function_response.name == "add"
+
+
+async def test_grok_tool_use_translation() -> None:
+    resp = SimpleNamespace(
+        content="",
+        tool_calls=[
+            SimpleNamespace(
+                id="c1", function=SimpleNamespace(name="add", arguments='{"a": 2, "b": 3}')
+            )
+        ],
+        usage=SimpleNamespace(prompt_tokens=1, completion_tokens=1, cached_prompt_text_tokens=0),
+        finish_reason="tool_calls",
+    )
+    fake = _FakeGrok(resp)
+    provider = GrokProvider(client=fake)
+    spec = ModelSpec(provider="grok", model="grok-4.3")
+
+    out = await provider.complete(
+        spec, Request(messages=[Message(role="user", content="2+3?")], tools=[_TOOL])
+    )
+    assert [(c.id, c.name, c.input) for c in out.tool_calls] == [("c1", "add", {"a": 2, "b": 3})]
+    assert fake.calls[0]["tools"][0].function.name == "add"
+
+    await provider.complete(spec, Request(messages=_HISTORY))
+    sent = fake.calls[1]["messages"]
+    assistant_msgs = [m for m in sent if list(getattr(m, "tool_calls", []))]
+    assert assistant_msgs and assistant_msgs[0].tool_calls[0].function.name == "add"
+    tool_msgs = [m for m in sent if getattr(m, "tool_call_id", "")]
+    assert tool_msgs and tool_msgs[0].tool_call_id == "c1"

@@ -6,12 +6,16 @@ from __future__ import annotations
 
 import os
 from collections.abc import Mapping
+from dataclasses import replace
 from typing import Any
 
 from maslul.config import RouterConfig
-from maslul.errors import ConfigError
+from maslul.errors import ConfigError, ProviderError
 from maslul.providers import Provider, build_provider
-from maslul.types import Level, ModelSpec, Request, Response
+from maslul.types import Level, Message, ModelSpec, Request, Response, ToolCall, Usage
+
+# Guard against a runaway tool loop (mirrors Kippy's llm.py).
+_MAX_TOOL_ITERATIONS = 8
 
 
 class Router:
@@ -61,10 +65,12 @@ class Router:
         return self._config
 
     async def complete(self, req: Request, *, level: Level | None = None) -> Response:
-        """Run a completion.
+        """Run a completion at the pinned ``level``.
 
-        M0 supports only an explicit ``level=`` pin: it dispatches to that tier's model.
-        Internal judgment (omitting ``level``) is not implemented until M4.
+        With ``req.tools`` + ``req.tool_executor``, the router drives the provider-agnostic
+        tool-use loop: call the model, run any requested tools, feed results back, repeat
+        until the model stops calling tools (or the iteration guard trips). Internal judgment
+        (omitting ``level``) is not implemented until M4.
         """
         if level is None:
             raise NotImplementedError(
@@ -72,9 +78,37 @@ class Router:
             )
         spec = self._spec_for_level(level)
         provider = self._provider_for(spec)
-        resp = await provider.complete(spec, req)
-        resp.level_used = level
-        return resp
+        if not req.tools or req.tool_executor is None:
+            resp = await provider.complete(spec, req)
+            resp.level_used = level
+            return resp
+        return await self._run_tool_loop(spec, provider, req, level)
+
+    async def _run_tool_loop(
+        self, spec: ModelSpec, provider: Provider, req: Request, level: Level
+    ) -> Response:
+        assert req.tool_executor is not None
+        messages = list(req.messages)
+        total = Usage()
+        executed: list[ToolCall] = []
+        for _ in range(_MAX_TOOL_ITERATIONS):
+            resp = await provider.complete(spec, replace(req, messages=messages))
+            _accumulate(total, resp.usage)
+            if not resp.tool_calls:
+                resp.usage = total
+                resp.tool_calls = executed  # surface the full tool I/O of the turn
+                resp.level_used = level
+                return resp
+            messages.append(
+                Message(role="assistant", content=resp.text, tool_calls=resp.tool_calls)
+            )
+            for call in resp.tool_calls:
+                executed.append(call)
+                result = await req.tool_executor(call)
+                messages.append(
+                    Message(role="tool", content=result, tool_call_id=call.id, name=call.name)
+                )
+        raise ProviderError(f"tool loop exceeded {_MAX_TOOL_ITERATIONS} iterations")
 
     def _spec_for_level(self, level: Level) -> ModelSpec:
         try:
@@ -90,3 +124,10 @@ class Router:
                 f"no provider registered for {spec.provider!r} "
                 f"(registered: {sorted(self._providers)})"
             ) from e
+
+
+def _accumulate(total: Usage, u: Usage) -> None:
+    total.input_tokens += u.input_tokens
+    total.output_tokens += u.output_tokens
+    total.cache_read_input_tokens += u.cache_read_input_tokens
+    total.cache_creation_input_tokens += u.cache_creation_input_tokens

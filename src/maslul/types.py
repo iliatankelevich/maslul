@@ -71,10 +71,18 @@ class ModelSpec:
 
 @dataclass
 class Message:
-    """One conversation turn. Content is plain text in M0; richer blocks land in M2."""
+    """One conversation turn.
+
+    Plain text uses ``role`` + ``content``. Tool use (M2): an ``assistant`` turn may carry
+    ``tool_calls``; a ``role="tool"`` turn holds the executor's output in ``content`` with the
+    ``tool_call_id`` it answers (``name`` is the tool, for providers that match results by name).
+    """
 
     role: Role
-    content: str
+    content: str = ""
+    tool_calls: list[ToolCall] = field(default_factory=list)
+    tool_call_id: str | None = None
+    name: str | None = None
 
 
 @dataclass

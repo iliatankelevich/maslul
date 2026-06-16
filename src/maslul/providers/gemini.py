@@ -1,8 +1,9 @@
 """Gemini provider — Google ``google-genai`` SDK via Vertex AI.
 
 Mirrors Kippy's auth pattern: Vertex AI + Application Default Credentials (no API key) when
-``vertex_project`` is set; an API key path is supported for OSS users who prefer the Gemini
-Developer API. M1 covers plain-text completion with normalized usage and finish reason.
+``vertex_project`` is set; an API-key path is supported for the Gemini Developer API. Covers
+plain-text completion (M1) and tool-use translation (M2): function declarations, the
+``function_call``/``function_response`` round-trip, normalized usage, and finish reason.
 """
 
 from __future__ import annotations
@@ -10,7 +11,7 @@ from __future__ import annotations
 from typing import Any
 
 from maslul.errors import ProviderError
-from maslul.types import ModelSpec, Request, Response, Usage
+from maslul.types import ModelSpec, Request, Response, ToolCall, Usage
 
 
 class GeminiProvider:
@@ -53,6 +54,19 @@ class GeminiProvider:
             config["temperature"] = req.temperature
         if req.stop:
             config["stop_sequences"] = req.stop
+        if req.tools:
+            config["tools"] = [
+                types.Tool(
+                    function_declarations=[
+                        types.FunctionDeclaration(
+                            name=t.name,
+                            description=t.description,
+                            parameters_json_schema=t.input_schema,
+                        )
+                        for t in req.tools
+                    ]
+                )
+            ]
         try:
             resp = await self._client.aio.models.generate_content(
                 model=spec.model,
@@ -62,11 +76,12 @@ class GeminiProvider:
         except Exception as e:  # noqa: BLE001 - normalized below
             raise ProviderError(str(e)) from e
         return Response(
-            text=resp.text or "",
+            text=_text(resp),
             level_used=None,
             provider=self.name,
             model=spec.model,
             usage=_usage(getattr(resp, "usage_metadata", None)),
+            tool_calls=_tool_calls(resp),
             finish_reason=_finish_reason(resp),
             raw=resp,
         )
@@ -78,13 +93,51 @@ class GeminiProvider:
 def _contents(req: Request) -> list[Any]:
     from google.genai import types
 
+    out: list[Any] = []
+    for m in req.messages:
+        if m.role == "tool":
+            out.append(
+                types.Content(
+                    role="tool",
+                    parts=[
+                        types.Part.from_function_response(
+                            name=m.name or "", response={"result": m.content}
+                        )
+                    ],
+                )
+            )
+        elif m.role == "assistant" and m.tool_calls:
+            parts: list[Any] = []
+            if m.content:
+                parts.append(types.Part.from_text(text=m.content))
+            parts += [
+                types.Part(function_call=types.FunctionCall(name=tc.name, args=tc.input))
+                for tc in m.tool_calls
+            ]
+            out.append(types.Content(role="model", parts=parts))
+        else:
+            out.append(
+                types.Content(
+                    role="model" if m.role == "assistant" else "user",
+                    parts=[types.Part.from_text(text=m.content)],
+                )
+            )
+    return out
+
+
+def _tool_calls(resp: Any) -> list[ToolCall]:
+    # Gemini function calls carry no id — match results back by name.
     return [
-        types.Content(
-            role="model" if m.role == "assistant" else "user",
-            parts=[types.Part.from_text(text=m.content)],
-        )
-        for m in req.messages
+        ToolCall(id=getattr(fc, "id", None) or fc.name, name=fc.name, input=dict(fc.args or {}))
+        for fc in (getattr(resp, "function_calls", None) or [])
     ]
+
+
+def _text(resp: Any) -> str:
+    try:
+        return resp.text or ""
+    except Exception:  # noqa: BLE001 - .text can raise when the turn is function-calls-only
+        return ""
 
 
 def _usage(um: Any) -> Usage:

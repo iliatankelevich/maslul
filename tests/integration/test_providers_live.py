@@ -8,10 +8,12 @@ provider with the ``MASLUL_*_MODEL`` env vars when the catalog moves.
 from __future__ import annotations
 
 import os
+from typing import Any
 
 import pytest
 
-from maslul.types import Message, ModelSpec, Request
+from maslul import Level, Router
+from maslul.types import Message, ModelSpec, Request, ToolDef
 
 requires_anthropic = pytest.mark.skipif(
     not os.getenv("ANTHROPIC_API_KEY"), reason="ANTHROPIC_API_KEY not set"
@@ -70,3 +72,50 @@ async def test_grok_live() -> None:
     assert resp.text.strip()
     assert resp.usage.output_tokens > 0
     await provider.healthcheck(spec)
+
+
+@requires_anthropic
+async def test_anthropic_tool_loop_live() -> None:
+    """End-to-end M2: the router drives a real calculator round-trip through Anthropic."""
+    from maslul.providers.anthropic import AnthropicProvider
+
+    model = os.getenv("MASLUL_ANTHROPIC_MODEL", "claude-haiku-4-5")
+    config = {
+        "maslul": {
+            "default_level": "hard",
+            "tiers": {"hard": {"provider": "anthropic", "model": model}},
+        }
+    }
+    router = Router(config, providers={"anthropic": AnthropicProvider()})
+
+    calls: list[str] = []
+
+    async def add(call: Any) -> str:  # noqa: ANN401 - ToolCall, kept loose for the test
+        calls.append(call.name)
+        return str(call.input["a"] + call.input["b"])
+
+    req = Request(
+        messages=[
+            Message(
+                role="user",
+                content="Use the add tool to compute 21 + 21, then state the resulting number.",
+            )
+        ],
+        tools=[
+            ToolDef(
+                name="add",
+                description="Add two integers a and b.",
+                input_schema={
+                    "type": "object",
+                    "properties": {"a": {"type": "integer"}, "b": {"type": "integer"}},
+                    "required": ["a", "b"],
+                },
+            )
+        ],
+        tool_executor=add,
+        max_tokens=256,
+    )
+    resp = await router.complete(req, level=Level.HARD)
+    assert calls == ["add"]
+    assert "42" in resp.text
+    assert any(c.name == "add" for c in resp.tool_calls)

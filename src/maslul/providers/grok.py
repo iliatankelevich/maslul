@@ -1,20 +1,23 @@
 """Grok provider — official xAI ``xai-sdk`` (gRPC; §8 resolved decision).
 
-The SDK exposes a stateful chat: ``client.chat.create(...)`` → ``chat.append(...)`` →
-``await chat.sample()``. M1 covers plain-text completion.
+Covers plain-text completion (M1) and tool-use translation (M2). The router owns the loop and
+rebuilds the conversation from normalized messages each turn, so this provider reconstructs the
+xAI chat statelessly: prior ``assistant`` tool-call turns become ``chat_pb2.Message`` protos with
+``tool_calls``, and tool results use ``tool_result(content, tool_call_id=...)`` (id-matched).
 
-⚠️ **Unverified-live:** the SDK docs don't expose the exact ``usage`` / ``finish_reason``
-field names, and no ``XAI_API_KEY`` was available to smoke-test. The text path is solid; the
-usage/finish-reason mapping is defensive (``getattr`` with sensible fallbacks) and must be
-confirmed against a live response — see ``tests/integration/test_providers_live.py``.
+⚠️ **Unverified-live:** no ``XAI_API_KEY`` was available to smoke-test. The proto shapes were
+confirmed against the installed SDK, but the reconstructed assistant tool-call turn and the
+``usage``/``finish_reason`` field mapping must be confirmed against a live response — see
+``tests/integration/test_providers_live.py``.
 """
 
 from __future__ import annotations
 
+import json
 from typing import Any
 
 from maslul.errors import AuthError, ProviderError, RateLimited, Timeout
-from maslul.types import ModelSpec, Request, Response, Usage
+from maslul.types import Message, ModelSpec, Request, Response, ToolCall, Usage
 
 
 class GrokProvider:
@@ -31,13 +34,16 @@ class GrokProvider:
         self._client = AsyncClient(api_key=api_key) if api_key else AsyncClient()
 
     async def complete(self, spec: ModelSpec, req: Request) -> Response:
-        from xai_sdk.chat import assistant, system, user
+        from xai_sdk.chat import system as system_msg
+        from xai_sdk.chat import tool as make_tool
 
-        messages = [system(s) for s in (req.system or [])]
-        messages += [
-            assistant(m.content) if m.role == "assistant" else user(m.content) for m in req.messages
-        ]
+        messages = [system_msg(s) for s in (req.system or [])] + _to_messages(req.messages)
         kwargs: dict[str, Any] = {"model": spec.model, "messages": messages}
+        if req.tools:
+            kwargs["tools"] = [
+                make_tool(name=t.name, description=t.description, parameters=t.input_schema)
+                for t in req.tools
+            ]
         max_tokens = req.max_tokens or spec.max_tokens
         if max_tokens:
             kwargs["max_tokens"] = max_tokens
@@ -54,6 +60,7 @@ class GrokProvider:
             provider=self.name,
             model=spec.model,
             usage=_usage(getattr(resp, "usage", None)),
+            tool_calls=_tool_calls(resp),
             finish_reason=_finish_reason(resp),
             raw=resp,
         )
@@ -63,6 +70,52 @@ class GrokProvider:
 
         chat = self._client.chat.create(model=spec.model, messages=[user("ping")])
         await chat.sample()
+
+
+def _to_messages(messages: list[Message]) -> list[Any]:
+    from xai_sdk.chat import assistant, chat_pb2, tool_result, user
+
+    out: list[Any] = []
+    for m in messages:
+        if m.role == "tool":
+            out.append(tool_result(m.content, tool_call_id=m.tool_call_id))
+        elif m.role == "assistant" and m.tool_calls:
+            msg = assistant(m.content) if m.content else assistant("")
+            for tc in m.tool_calls:
+                msg.tool_calls.append(
+                    chat_pb2.ToolCall(
+                        id=tc.id,
+                        type=chat_pb2.ToolCallType.TOOL_CALL_TYPE_CLIENT_SIDE_TOOL,
+                        function=chat_pb2.FunctionCall(
+                            name=tc.name, arguments=json.dumps(tc.input)
+                        ),
+                    )
+                )
+            out.append(msg)
+        elif m.role == "assistant":
+            out.append(assistant(m.content))
+        else:
+            out.append(user(m.content))
+    return out
+
+
+def _tool_calls(resp: Any) -> list[ToolCall]:
+    out: list[ToolCall] = []
+    for tc in getattr(resp, "tool_calls", None) or []:
+        fn = getattr(tc, "function", None)
+        raw_args = getattr(fn, "arguments", "") if fn is not None else ""
+        try:
+            args = json.loads(raw_args) if raw_args else {}
+        except (ValueError, TypeError):
+            args = {}
+        out.append(
+            ToolCall(
+                id=getattr(tc, "id", "") or "",
+                name=getattr(fn, "name", "") if fn is not None else "",
+                input=args,
+            )
+        )
+    return out
 
 
 def _usage(u: Any) -> Usage:
