@@ -8,9 +8,12 @@ from maslul import (
     ConfigError,
     Level,
     Message,
+    ModelSpec,
+    ModelUsage,
     Request,
     Response,
     Router,
+    RoutingDecision,
     Strategy,
     ToolCall,
     ToolDef,
@@ -51,10 +54,81 @@ async def test_level_dispatch_returns_normalized_response() -> None:
     assert fake.calls[0][0].model == "small"
 
 
-async def test_complete_without_level_is_not_implemented_yet() -> None:
+async def test_route_default_uses_default_level_when_no_level_pinned() -> None:
     router = Router(_config(), providers={"fake": FakeProvider("fake")})
+    resp = await router.complete(_req())  # no level → ROUTE_DEFAULT → default_level (hard)
+    assert resp.level_used is Level.HARD
+    assert resp.model == "big"
+
+
+async def test_model_pin_skips_routing() -> None:
+    fake = FakeProvider("fake")
+    router = Router(_config(), providers={"fake": fake})
+    resp = await router.complete(_req(), model=ModelSpec(provider="fake", model="exact-model"))
+    assert resp.model == "exact-model"
+    assert resp.level_used is None  # a model pin is not a tier decision
+    assert fake.calls[0][0].model == "exact-model"
+
+
+async def test_hard_signal_escalates_to_hard() -> None:
+    # default_level is SIMPLE here, so routing to HARD can only come from the hard-signal detector
+    config = _config()
+    config["maslul"]["default_level"] = "simple"
+    router = Router(config, providers={"fake": FakeProvider("fake")})
+
+    plain = Request(messages=[Message(role="user", content="hi there")])
+    assert (await router.complete(plain)).level_used is Level.SIMPLE  # no signal → default
+
+    hard = Request(messages=[Message(role="user", content="תחקור את הנושא הזה לעומק")])
+    assert (await router.complete(hard)).level_used is Level.HARD  # intent verb → HARD
+
+
+async def test_bypass_predicate_picks_tier() -> None:
+    def bypass(req: Request) -> Level | None:
+        return Level.SIMPLE if "hi" in req.messages[-1].content else None
+
+    router = Router(_config(), providers={"fake": FakeProvider("fake")}, bypass_predicate=bypass)
+    resp = await router.complete(Request(messages=[Message(role="user", content="hi")]))
+    assert resp.level_used is Level.SIMPLE  # bypass fired (beats ROUTE_DEFAULT's hard)
+
+
+async def test_custom_classifier_resolves_middle() -> None:
+    async def classify(req: Request) -> Level:  # async classifier supported
+        return Level.MEDIUM
+
+    router = Router(_config(), providers={"fake": FakeProvider("fake")}, classifier=classify)
+    resp = await router.complete(_req())
+    assert resp.level_used is Level.MEDIUM
+    assert resp.model == "mid"
+
+
+async def test_route_and_complete_hooks_fire() -> None:
+    decisions: list[RoutingDecision] = []
+    completions: list[Response] = []
+    router = Router(
+        _config(),
+        providers={"fake": FakeProvider("fake")},
+        on_route=lambda _req, decision: decisions.append(decision),
+        on_complete=completions.append,
+    )
+    await router.complete(_req())
+    assert len(decisions) == 1 and decisions[0].reason == "strategy:route_default"
+    assert decisions[0].level is Level.HARD
+    assert len(completions) == 1 and completions[0].model == "big"
+
+
+async def test_usage_records_expose_per_model_breakdown() -> None:
+    router = Router(_config(), providers={"fake": FakeProvider("fake")})
+    resp = await router.complete(_req(), level=Level.SIMPLE)
+    assert resp.usage_records == [ModelUsage(provider="fake", model="small", usage=resp.usage)]
+
+
+async def test_classify_strategy_deferred_to_part2() -> None:
+    config = _config()
+    config["maslul"]["strategy"] = "classify"
+    router = Router(config, providers={"fake": FakeProvider("fake")})
     with pytest.raises(NotImplementedError):
-        await router.complete(_req())
+        await router.complete(_req())  # no custom classifier → CLASSIFY not yet implemented
 
 
 async def test_missing_provider_raises_config_error() -> None:

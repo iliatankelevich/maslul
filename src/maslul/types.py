@@ -144,6 +144,17 @@ class Usage:
 
 
 @dataclass
+class ModelUsage:
+    """Tokens attributed to one ``provider:model`` within a request — a request can span
+    several (a classifier model, the answer model, tool-loop iterations). The per-model
+    breakdown the usage-metrics hook reports."""
+
+    provider: str
+    model: str
+    usage: Usage
+
+
+@dataclass
 class Response:
     """A normalized completion result."""
 
@@ -151,10 +162,32 @@ class Response:
     level_used: Level | None
     provider: str
     model: str
-    usage: Usage
+    usage: Usage  # total across every model call in the request (sum of usage_records)
     structured: Any | None = None
     tool_calls: list[ToolCall] = field(default_factory=list)
     finish_reason: str | None = None
     sources: list[str] = field(default_factory=list)
     classification_usage: Usage | None = None
+    usage_records: list[ModelUsage] = field(default_factory=list)  # per-model breakdown
     raw: Any = None
+
+
+@dataclass(frozen=True)
+class RoutingDecision:
+    """Why the router picked this model — passed to the ``on_route`` hook for observability."""
+
+    spec: ModelSpec
+    level: Level | None  # None when a model was pinned directly
+    reason: str  # model_pinned | level_pinned | bypass | hard_signal | strategy:<name>
+
+
+#: Resolves the difficulty tier for a request, or returns None to defer to the configured
+#: strategy. The caller's own classification method (may be sync or async).
+Classifier = Callable[[Request], "Level | None | Awaitable[Level | None]"]
+#: Deterministic fast-path: pick a tier with no model judgment (e.g. greetings → SIMPLE), or None.
+BypassPredicate = Callable[[Request], "Level | None"]
+#: UP-only escalation signal: True routes the request to HARD without a classifier call.
+HardSignal = Callable[[Request], bool]
+#: Observability hooks.
+RouteHook = Callable[[Request, RoutingDecision], None]
+CompleteHook = Callable[[Response], None]
