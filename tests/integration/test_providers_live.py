@@ -26,9 +26,11 @@ requires_grok = pytest.mark.skipif(not os.getenv("XAI_API_KEY"), reason="XAI_API
 
 
 def _prompt() -> Request:
+    # Headroom matters: thinking models (e.g. gemini-2.5-flash) spend tokens reasoning before
+    # any visible text, so too small a budget yields an empty MAX_TOKENS response.
     return Request(
         messages=[Message(role="user", content="Reply with exactly the word: pong")],
-        max_tokens=16,
+        max_tokens=512,
     )
 
 
