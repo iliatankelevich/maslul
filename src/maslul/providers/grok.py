@@ -5,10 +5,9 @@ rebuilds the conversation from normalized messages each turn, so this provider r
 xAI chat statelessly: prior ``assistant`` tool-call turns become ``chat_pb2.Message`` protos with
 ``tool_calls``, and tool results use ``tool_result(content, tool_call_id=...)`` (id-matched).
 
-⚠️ **Unverified-live:** no ``XAI_API_KEY`` was available to smoke-test. The proto shapes were
-confirmed against the installed SDK, but the reconstructed assistant tool-call turn and the
-``usage``/``finish_reason`` field mapping must be confirmed against a live response — see
-``tests/integration/test_providers_live.py``.
+Verified live against ``grok-4.3`` — text + usage, and a calculator tool round-trip that
+exercises the reconstructed assistant tool-call turn (see
+``tests/integration/test_providers_live.py``).
 """
 
 from __future__ import annotations

@@ -74,19 +74,26 @@ async def test_grok_live() -> None:
     await provider.healthcheck(spec)
 
 
-@requires_anthropic
-async def test_anthropic_tool_loop_live() -> None:
-    """End-to-end M2: the router drives a real calculator round-trip through Anthropic."""
-    from maslul.providers.anthropic import AnthropicProvider
+_ADD_TOOL = ToolDef(
+    name="add",
+    description="Add two integers a and b.",
+    input_schema={
+        "type": "object",
+        "properties": {"a": {"type": "integer"}, "b": {"type": "integer"}},
+        "required": ["a", "b"],
+    },
+)
 
-    model = os.getenv("MASLUL_ANTHROPIC_MODEL", "claude-haiku-4-5")
+
+async def _calculator_round_trip(provider_name: str, provider: Any, model: str) -> None:
+    """End-to-end M2: the router drives a real calculator tool round-trip through ``provider``."""
     config = {
         "maslul": {
             "default_level": "hard",
-            "tiers": {"hard": {"provider": "anthropic", "model": model}},
+            "tiers": {"hard": {"provider": provider_name, "model": model}},
         }
     }
-    router = Router(config, providers={"anthropic": AnthropicProvider()})
+    router = Router(config, providers={provider_name: provider})
 
     calls: list[str] = []
 
@@ -101,17 +108,7 @@ async def test_anthropic_tool_loop_live() -> None:
                 content="Use the add tool to compute 21 + 21, then state the resulting number.",
             )
         ],
-        tools=[
-            ToolDef(
-                name="add",
-                description="Add two integers a and b.",
-                input_schema={
-                    "type": "object",
-                    "properties": {"a": {"type": "integer"}, "b": {"type": "integer"}},
-                    "required": ["a", "b"],
-                },
-            )
-        ],
+        tools=[_ADD_TOOL],
         tool_executor=add,
         max_tokens=256,
     )
@@ -119,3 +116,20 @@ async def test_anthropic_tool_loop_live() -> None:
     assert calls == ["add"]
     assert "42" in resp.text
     assert any(c.name == "add" for c in resp.tool_calls)
+
+
+@requires_anthropic
+async def test_anthropic_tool_loop_live() -> None:
+    from maslul.providers.anthropic import AnthropicProvider
+
+    model = os.getenv("MASLUL_ANTHROPIC_MODEL", "claude-haiku-4-5")
+    await _calculator_round_trip("anthropic", AnthropicProvider(), model)
+
+
+@requires_grok
+async def test_grok_tool_loop_live() -> None:
+    # Exercises the stateless reconstruction of the assistant tool-call turn (the M2 risk).
+    from maslul.providers.grok import GrokProvider
+
+    model = os.getenv("MASLUL_GROK_MODEL", "grok-4.3")
+    await _calculator_round_trip("grok", GrokProvider(), model)
