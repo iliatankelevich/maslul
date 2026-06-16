@@ -7,12 +7,27 @@ requires-python = ">=3.12"
 license = "MIT"
 license-files = ["LICENSE"]
 authors = [{ name = "Ilia Tankelevich" }]
+keywords = ["llm", "router", "anthropic", "claude", "gemini", "grok", "xai", "async"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Typing :: Typed",
+]
 dependencies = []   # core is stdlib-only; provider SDKs live behind the extras below
 
 [project.optional-dependencies]
 anthropic = ["anthropic>=0.109.1"]
 gemini = ["google-genai>=2.8.0"]
 grok = ["xai-sdk>=1.0.0"]
+
+[project.urls]
+Homepage = "https://github.com/iliatankelevich/maslul"
+Repository = "https://github.com/iliatankelevich/maslul"
+Issues = "https://github.com/iliatankelevich/maslul/issues"
+Changelog = "https://github.com/iliatankelevich/maslul/blob/main/CHANGELOG.md"
 
 [dependency-groups]
 dev = [

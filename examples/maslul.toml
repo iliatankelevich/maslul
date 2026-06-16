@@ -1,0 +1,15 @@
+# Minimal example config for quickstart.py — Anthropic only, so it runs with just
+# ANTHROPIC_API_KEY set. See the README for the full multi-provider shape.
+[maslul]
+strategy = "route_default"
+default_level = "hard"
+
+[maslul.tiers.simple]
+model = "anthropic:claude-haiku-4-5"
+[maslul.tiers.medium]
+model = "anthropic:claude-haiku-4-5"
+[maslul.tiers.hard]
+model = "anthropic:claude-sonnet-4-6"
+
+[maslul.providers.anthropic]
+api_key_env = "ANTHROPIC_API_KEY"
