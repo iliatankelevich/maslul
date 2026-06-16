@@ -10,7 +10,7 @@ from typing import Any
 
 from maslul.config import RouterConfig
 from maslul.errors import ConfigError
-from maslul.providers.base import Provider
+from maslul.providers import Provider, build_provider
 from maslul.types import Level, ModelSpec, Request, Response
 
 
@@ -18,27 +18,43 @@ class Router:
     """Routes a :class:`Request` to a provider/model and returns a normalized
     :class:`Response`.
 
-    M0 supports only an explicit ``level=`` pin. The provider registry is injected
-    (the ``FakeProvider`` in tests); auto-building real providers from the
-    ``[maslul.providers.*]`` config lands in M1.
+    M0 supports only an explicit ``level=`` pin. ``providers`` may be injected (the
+    ``FakeProvider`` in tests); when omitted, the providers named by the configured tiers
+    and classifier are auto-built from the ``[maslul.providers.*]`` config.
     """
 
     def __init__(
         self,
         config: RouterConfig | Mapping[str, Any],
-        providers: Mapping[str, Provider],
+        providers: Mapping[str, Provider] | None = None,
     ) -> None:
         self._config = (
             config if isinstance(config, RouterConfig) else RouterConfig.from_dict(config)
         )
+        if providers is None:
+            providers = {
+                name: build_provider(name, self._config.providers.get(name, {}))
+                for name in self._provider_names()
+            }
         self._providers: dict[str, Provider] = dict(providers)
 
     @classmethod
-    def from_toml(cls, path: str | os.PathLike[str], providers: Mapping[str, Provider]) -> Router:
-        """Build a router from a TOML config file. ``providers`` is injected in M0;
-        auto-building real provider instances from config lands in M1.
+    def from_toml(
+        cls,
+        path: str | os.PathLike[str],
+        providers: Mapping[str, Provider] | None = None,
+    ) -> Router:
+        """Build a router from a TOML config file. Omit ``providers`` to auto-build them
+        from the ``[maslul.providers.*]`` config; inject them for tests or custom wiring.
         """
         return cls(RouterConfig.from_toml(path), providers)
+
+    def _provider_names(self) -> set[str]:
+        """Provider names referenced by the configured tiers and classifier."""
+        names = {spec.provider for spec in self._config.tiers.values()}
+        if self._config.classifier is not None:
+            names.add(self._config.classifier.provider)
+        return names
 
     @property
     def config(self) -> RouterConfig:

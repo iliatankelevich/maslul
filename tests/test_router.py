@@ -58,3 +58,21 @@ def test_from_dict_parses_tiers_and_routing_knobs() -> None:
     assert cfg.default_level is Level.HARD
     assert cfg.tiers[Level.SIMPLE].model == "small"
     assert cfg.tiers[Level.HARD].model == "big"
+
+
+async def test_router_auto_builds_providers_when_none_injected(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    built: list[str] = []
+
+    def fake_build(name: str, config: dict[str, Any]) -> FakeProvider:
+        built.append(name)
+        return FakeProvider(name)
+
+    monkeypatch.setattr("maslul.router.build_provider", fake_build)
+
+    router = Router(_config())  # no providers → auto-build the names the tiers reference
+    resp = await router.complete(_req(), level=Level.SIMPLE)
+
+    assert built == ["fake"]  # built once, only the referenced provider
+    assert resp.provider == "fake"

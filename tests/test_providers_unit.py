@@ -8,6 +8,10 @@ from __future__ import annotations
 from types import SimpleNamespace
 from typing import Any
 
+import pytest
+
+from maslul.errors import ConfigError
+from maslul.providers import build_provider
 from maslul.providers.anthropic import AnthropicProvider
 from maslul.providers.gemini import GeminiProvider
 from maslul.providers.grok import GrokProvider
@@ -131,3 +135,20 @@ async def test_grok_normalizes_text_usage_and_finish_reason() -> None:
     assert (out.usage.input_tokens, out.usage.output_tokens) == (4, 2)
     assert out.finish_reason == "stop"
     assert fake.calls[0]["model"] == "grok-4.3"
+
+
+# --- build_provider factory --------------------------------------------------------------
+
+
+async def test_build_provider_dispatches_by_name(monkeypatch: pytest.MonkeyPatch) -> None:
+    # async so a running event loop exists — xai_sdk.AsyncClient grabs it at construction.
+    monkeypatch.setenv("MASLUL_DUMMY_KEY", "dummy")
+    cfg = {"api_key_env": "MASLUL_DUMMY_KEY"}
+    assert isinstance(build_provider("anthropic", cfg), AnthropicProvider)
+    assert isinstance(build_provider("gemini", cfg), GeminiProvider)
+    assert isinstance(build_provider("grok", cfg), GrokProvider)
+
+
+def test_build_provider_unknown_raises() -> None:
+    with pytest.raises(ConfigError):
+        build_provider("openai", {})
