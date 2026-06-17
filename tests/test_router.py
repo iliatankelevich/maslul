@@ -238,6 +238,34 @@ async def test_classify_and_answer_runs_tool_loop() -> None:
     assert resp.level_used is None  # answered inline
 
 
+async def test_classify_and_answer_guidance_reaches_pinned_provider_options_system() -> None:
+    # An Anthropic-style caller pins the system via provider_options["system"] (a list of cached
+    # content blocks), which the provider lets OVERRIDE req.system. The escalate-or-answer guidance
+    # must be injected there too, or the classifier never sees it and can't self-escalate.
+    from maslul.router import _CLASSIFY_AND_ANSWER_GUIDANCE
+
+    fake = FakeProvider("fake", text="answered")
+    router = Router(
+        _classify_config("classify_and_answer", classifier_model="floor"), providers={"fake": fake}
+    )
+    persona = {"type": "text", "text": "PERSONA", "cache_control": {"type": "ephemeral"}}
+    req = Request(
+        messages=[Message(role="user", content="hi")],
+        system=["base"],
+        provider_options={"system": [persona]},
+    )
+    await router.complete(req)
+    _, seen = fake.calls[0]
+    # Injected into BOTH places: req.system (for Gemini/Grok/OpenAI) ...
+    assert seen.system is not None
+    assert seen.system[0] == _CLASSIFY_AND_ANSWER_GUIDANCE
+    assert seen.system[1] == "base"
+    # ... and the pinned Anthropic system (or it'd be lost), without dropping the persona block.
+    pinned = seen.provider_options["system"]
+    assert pinned[0]["text"] == _CLASSIFY_AND_ANSWER_GUIDANCE
+    assert pinned[1] == persona
+
+
 async def test_classify_without_classifier_config_raises() -> None:
     config = _config()
     config["maslul"]["strategy"] = "classify"

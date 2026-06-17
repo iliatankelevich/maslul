@@ -340,7 +340,7 @@ class Router:
         any tools run; an answer then continues the tool loop seeded by it (no extra model call)."""
         spec = self._require_classifier()
         provider = self._provider_for(spec)
-        guided = replace(req, system=[_CLASSIFY_AND_ANSWER_GUIDANCE, *(req.system or [])])
+        guided = _with_guidance(req, _CLASSIFY_AND_ANSWER_GUIDANCE)
         first = await self._invoke(provider, spec, guided)
         target = _parse_escalation(first.text)
         if target is not None:  # declined → escalate; the classifier call still cost tokens
@@ -576,6 +576,27 @@ def _parse_escalation(text: str) -> Level | None:
     if match is None:
         return None
     return _LEVEL_BY_NAME.get(match.group(1).lower(), Level.HARD)
+
+
+def _with_guidance(req: Request, guidance: str) -> Request:
+    """Prepend a system instruction so it reaches the model *regardless of how the system prompt is
+    delivered*. It always goes into ``req.system`` (which Gemini/Grok/OpenAI read). When a caller
+    pins the system via ``provider_options["system"]`` — Anthropic's prompt-caching pattern, where
+    that value *overrides* ``req.system`` — the guidance is prepended there too, or it would be
+    silently dropped (this broke ``classify_and_answer`` self-escalation for cached Anthropic
+    callers). The original system value is preserved; only a constant prefix is added."""
+    system = [guidance, *(req.system or [])]
+    pinned = req.provider_options.get("system")
+    if pinned is None:
+        return replace(req, system=system)
+    options = dict(req.provider_options)
+    if isinstance(pinned, str):
+        options["system"] = f"{guidance}\n\n{pinned}"
+    elif isinstance(pinned, list):
+        # Anthropic structured system: a list of content blocks (often cache_control-marked).
+        options["system"] = [{"type": "text", "text": guidance}, *pinned]
+    # Any other shape: leave provider_options untouched; req.system still carries the guidance.
+    return replace(req, system=system, provider_options=options)
 
 
 def _record(ledger: dict[tuple[str, str], Usage], resp: Response) -> None:

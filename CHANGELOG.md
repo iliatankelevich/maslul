@@ -6,6 +6,17 @@ All notable changes to **maslul** are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-06-17
+
+### Fixed
+- **`CLASSIFY_AND_ANSWER` now self-escalates even when the caller pins the system via
+  `provider_options["system"]`.** The escalate-or-answer guidance was only added to `req.system`,
+  but Anthropic's prompt-caching pattern passes the system through `provider_options`, which
+  *overrides* `req.system` — so a cached Anthropic classifier never saw the guidance and answered
+  everything instead of escalating. The guidance is now also prepended to the pinned
+  `provider_options["system"]` (string or content-block list), preserving the original system and
+  its cache markers. Other providers are unaffected (they read `req.system`).
+
 ## [0.2.0] - 2026-06-17
 
 A fourth provider (OpenAI), web-search parity across all providers, a response cache, graceful
