@@ -22,6 +22,7 @@ dependencies = []   # core is stdlib-only; provider SDKs live behind the extras 
 anthropic = ["anthropic>=0.109.1"]
 gemini = ["google-genai>=2.8.0"]
 grok = ["xai-sdk>=1.0.0"]
+openai = ["openai>=1.0.0"]
 
 [project.urls]
 Homepage = "https://github.com/iliatankelevich/maslul"

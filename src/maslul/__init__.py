@@ -1,4 +1,4 @@
-"""maslul — an async, fully-typed LLM router across Anthropic, Gemini, and Grok.
+"""maslul — an async, fully-typed LLM router across Anthropic, Gemini, Grok, and OpenAI.
 
 Wraps multiple providers behind one call and routes each request to a model *tier* by
 difficulty; the caller can always pin a level or an exact ``provider:model``.

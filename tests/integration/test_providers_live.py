@@ -23,6 +23,9 @@ requires_gemini = pytest.mark.skipif(
     reason="no Vertex project configured (set MASLUL_VERTEX_PROJECT)",
 )
 requires_grok = pytest.mark.skipif(not os.getenv("XAI_API_KEY"), reason="XAI_API_KEY not set")
+requires_openai = pytest.mark.skipif(
+    not os.getenv("OPENAI_API_KEY"), reason="OPENAI_API_KEY not set"
+)
 
 
 def _prompt() -> Request:
@@ -290,6 +293,53 @@ async def test_grok_web_search_live() -> None:
     from maslul.providers.grok import GrokProvider
 
     await _web_search_round_trip("grok", GrokProvider(), os.getenv("MASLUL_GROK_MODEL", "grok-4.3"))
+
+
+# --- OpenAI (live) — the full provider surface in one place ------------------------------
+
+
+def _openai_provider() -> Any:
+    from maslul.providers.openai import OpenAIProvider
+
+    return OpenAIProvider()
+
+
+@requires_openai
+async def test_openai_live() -> None:
+    provider = _openai_provider()
+    spec = ModelSpec(provider="openai", model=os.getenv("MASLUL_OPENAI_MODEL", "gpt-4o-mini"))
+    resp = await provider.complete(spec, _prompt())
+    assert resp.text.strip()
+    assert resp.usage.output_tokens > 0
+    await provider.healthcheck(spec)
+
+
+@requires_openai
+async def test_openai_tool_loop_live() -> None:
+    await _calculator_round_trip(
+        "openai", _openai_provider(), os.getenv("MASLUL_OPENAI_MODEL", "gpt-4o-mini")
+    )
+
+
+@requires_openai
+async def test_openai_structured_live() -> None:
+    await _structured_round_trip(
+        "openai", _openai_provider(), os.getenv("MASLUL_OPENAI_MODEL", "gpt-4o-mini")
+    )
+
+
+@requires_openai
+async def test_openai_vision_live() -> None:
+    await _vision_round_trip(
+        "openai", _openai_provider(), os.getenv("MASLUL_OPENAI_MODEL", "gpt-4o-mini")
+    )
+
+
+@requires_openai
+async def test_openai_web_search_live() -> None:
+    # Web search needs a search-capable model.
+    model = os.getenv("MASLUL_OPENAI_SEARCH_MODEL", "gpt-4o-search-preview")
+    await _web_search_round_trip("openai", _openai_provider(), model)
 
 
 # --- M4: classify strategies (live, Anthropic) -------------------------------------------

@@ -28,7 +28,8 @@ src/maslul/
    ├─ _common.py      tiny shared helpers (no SDK)
    ├─ anthropic.py    AnthropicProvider   (extra: anthropic)
    ├─ gemini.py       GeminiProvider      (extra: gemini)
-   └─ grok.py         GrokProvider        (extra: grok)
+   ├─ grok.py         GrokProvider        (extra: grok)
+   └─ openai.py       OpenAIProvider      (extra: openai)
 ```
 
 **The core is stdlib-only and import-light.** `import maslul` pulls in *no* provider SDK — a
@@ -154,6 +155,7 @@ on them.
 | `anthropic` | `anthropic` | `ANTHROPIC_API_KEY` | `web_search` server tool (pause/resume), prompt caching via `provider_options` |
 | `gemini` | `google-genai` | Vertex AI + ADC, or API key | `function_call`/`function_response`, `response_json_schema`, `google_search` grounding |
 | `grok` | `xai-sdk` (gRPC) | `XAI_API_KEY` | stateful chat reconstructed each turn; Agent Tools `web_search` |
+| `openai` | `openai` | `OPENAI_API_KEY` | Chat Completions; `web_search_options` + `url_citation` annotations |
 
 ---
 

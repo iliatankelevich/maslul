@@ -16,7 +16,7 @@ from maslul.errors import ConfigError, MaslulError
 
 #: Provider names Maslul knows how to dispatch to. The ``provider`` prefix of a
 #: ``"provider:model"`` spec must be one of these.
-KNOWN_PROVIDERS: frozenset[str] = frozenset({"anthropic", "gemini", "grok"})
+KNOWN_PROVIDERS: frozenset[str] = frozenset({"anthropic", "gemini", "grok", "openai"})
 
 #: A JSON Schema document — used for structured output and tool input schemas.
 JsonSchema = dict[str, Any]

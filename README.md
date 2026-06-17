@@ -37,7 +37,7 @@ pip install "maslul[anthropic,gemini,grok]"     # or just the providers you use
 
 Each provider's SDK lives behind an extra, so `import maslul` pulls in **none** of them — you
 only install what you route to. `maslul[anthropic]` → `anthropic`; `maslul[gemini]` →
-`google-genai`; `maslul[grok]` → `xai-sdk`.
+`google-genai`; `maslul[grok]` → `xai-sdk`; `maslul[openai]` → `openai`.
 
 ## Routing
 
@@ -168,6 +168,7 @@ custom wiring.
 | `anthropic` | `anthropic` | `ANTHROPIC_API_KEY` |
 | `gemini` | `google-genai` | Vertex AI + ADC (`vertex_project`), or a Gemini Developer API key |
 | `grok` | `xai-sdk` | `XAI_API_KEY` |
+| `openai` | `openai` | `OPENAI_API_KEY` |
 
 ## Status
 

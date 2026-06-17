@@ -56,6 +56,13 @@ def build_provider(name: str, config: Mapping[str, Any]) -> Provider:
         if not key:
             raise ConfigError("grok not configured (set api_key_env or XAI_API_KEY)")
         return GrokProvider(api_key=key)
+    if name == "openai":
+        from maslul.providers.openai import OpenAIProvider
+
+        key = _env(config.get("api_key_env")) or os.environ.get("OPENAI_API_KEY")
+        if not key:
+            raise ConfigError("openai not configured (set api_key_env or OPENAI_API_KEY)")
+        return OpenAIProvider(api_key=key)
     raise ConfigError(f"unknown provider {name!r} — expected one of {sorted(KNOWN_PROVIDERS)}")
 
 

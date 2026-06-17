@@ -11,7 +11,7 @@ def test_model_spec_parse_valid() -> None:
     assert spec.model == "claude-sonnet-4-6"
 
 
-@pytest.mark.parametrize("bad", ["claude-sonnet", "openai:gpt-4", "anthropic:", ":model", ""])
+@pytest.mark.parametrize("bad", ["claude-sonnet", "cohere:command", "anthropic:", ":model", ""])
 def test_model_spec_parse_rejects_bad(bad: str) -> None:
     with pytest.raises(ConfigError):
         ModelSpec.parse(bad)

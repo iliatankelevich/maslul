@@ -17,6 +17,7 @@ from maslul.providers import build_provider
 from maslul.providers.anthropic import AnthropicProvider
 from maslul.providers.gemini import GeminiProvider
 from maslul.providers.grok import GrokProvider
+from maslul.providers.openai import OpenAIProvider
 from maslul.types import MediaPart, Message, ModelSpec, Request, ToolCall, ToolDef
 
 
@@ -149,6 +150,7 @@ async def test_build_provider_dispatches_by_name(monkeypatch: pytest.MonkeyPatch
     assert isinstance(build_provider("anthropic", cfg), AnthropicProvider)
     assert isinstance(build_provider("gemini", cfg), GeminiProvider)
     assert isinstance(build_provider("grok", cfg), GrokProvider)
+    assert isinstance(build_provider("openai", cfg), OpenAIProvider)
 
 
 def test_build_provider_unknown_raises() -> None:
@@ -488,3 +490,90 @@ async def test_grok_web_search_adds_server_tool_and_maps_citations() -> None:
     # xAI Agent Tools API: web_search is a server-side Tool entry (not the deprecated SearchParams).
     assert any(t.HasField("web_search") for t in fake.calls[0]["tools"])
     assert out.sources == ["https://ex.com/b"]
+
+
+# --- OpenAI ------------------------------------------------------------------------------
+
+
+class _FakeOpenAI:
+    def __init__(self, resp: Any) -> None:
+        self.calls: list[dict[str, Any]] = []
+        self.chat = SimpleNamespace(completions=SimpleNamespace(create=self._create))
+        self._resp = resp
+
+    async def _create(self, **kwargs: Any) -> Any:
+        self.calls.append(kwargs)
+        return self._resp
+
+
+def _oai_resp(
+    content: str | None = "",
+    tool_calls: Any = None,
+    annotations: Any = None,
+    finish: str = "stop",
+) -> Any:
+    message = SimpleNamespace(content=content, tool_calls=tool_calls, annotations=annotations)
+    return SimpleNamespace(
+        choices=[SimpleNamespace(message=message, finish_reason=finish)],
+        usage=SimpleNamespace(
+            prompt_tokens=4,
+            completion_tokens=2,
+            prompt_tokens_details=SimpleNamespace(cached_tokens=1),
+        ),
+    )
+
+
+async def test_openai_normalizes_text_usage_and_finish_reason() -> None:
+    fake = _FakeOpenAI(_oai_resp(content="hi from openai"))
+    out = await OpenAIProvider(client=fake).complete(
+        ModelSpec(provider="openai", model="gpt-4o"), _req()
+    )
+    assert out.text == "hi from openai"
+    assert out.provider == "openai"
+    assert (out.usage.input_tokens, out.usage.output_tokens) == (4, 2)
+    assert out.usage.cache_read_input_tokens == 1
+    assert out.finish_reason == "stop"
+    assert fake.calls[0]["messages"][0] == {"role": "system", "content": "be terse"}
+
+
+async def test_openai_tool_use_translation() -> None:
+    tc = SimpleNamespace(
+        id="c1", function=SimpleNamespace(name="add", arguments='{"a": 2, "b": 3}')
+    )
+    fake = _FakeOpenAI(_oai_resp(content=None, tool_calls=[tc], finish="tool_calls"))
+    provider = OpenAIProvider(client=fake)
+    spec = ModelSpec(provider="openai", model="gpt-4o")
+
+    out = await provider.complete(
+        spec, Request(messages=[Message(role="user", content="2+3?")], tools=[_TOOL])
+    )
+    assert [(c.id, c.name, c.input) for c in out.tool_calls] == [("c1", "add", {"a": 2, "b": 3})]
+    assert fake.calls[0]["tools"][0]["function"]["name"] == "add"
+
+    await provider.complete(spec, Request(messages=_HISTORY))
+    sent = fake.calls[1]["messages"]
+    assert any(m.get("role") == "assistant" and m.get("tool_calls") for m in sent)
+    tool_msg = next(m for m in sent if m.get("role") == "tool")
+    assert tool_msg["tool_call_id"] == "c1" and tool_msg["content"] == "5"
+
+
+async def test_openai_structured_and_media_translation() -> None:
+    fake = _FakeOpenAI(_oai_resp(content='{"ok": true}'))
+    await OpenAIProvider(client=fake).complete(
+        ModelSpec(provider="openai", model="gpt-4o"), _vision_req()
+    )
+    kwargs = fake.calls[0]
+    assert kwargs["response_format"]["json_schema"]["schema"] == _SCHEMA
+    user_content = kwargs["messages"][-1]["content"]
+    assert any(b.get("type") == "image_url" for b in user_content)
+
+
+async def test_openai_web_search_sets_options_and_maps_citations() -> None:
+    ann = SimpleNamespace(type="url_citation", url_citation=SimpleNamespace(url="https://ex.com/c"))
+    fake = _FakeOpenAI(_oai_resp(content="grounded", annotations=[ann, ann]))  # de-duped
+    out = await OpenAIProvider(client=fake).complete(
+        ModelSpec(provider="openai", model="gpt-4o-search-preview"),
+        Request(messages=[Message(role="user", content="news?")], web_search=True),
+    )
+    assert fake.calls[0]["web_search_options"] == {}
+    assert out.sources == ["https://ex.com/c"]
