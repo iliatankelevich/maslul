@@ -33,6 +33,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import replace
 from typing import Any
 
+from maslul.cache import Embedder, ResponseCache
 from maslul.config import RouterConfig
 from maslul.errors import AuthError, ConfigError, MaslulError, ProviderError, RateLimited, Timeout
 from maslul.providers import Provider, build_provider
@@ -106,6 +107,7 @@ class Router:
         providers: Mapping[str, Provider] | None = None,
         *,
         missing_provider: str = "error",
+        embed: Embedder | None = None,
         bypass_predicate: BypassPredicate | None = None,
         hard_signal: HardSignal | None = None,
         classifier: Classifier | None = None,
@@ -127,6 +129,7 @@ class Router:
         self._providers: dict[str, Provider] = dict(providers)
         if missing_provider == "degrade":
             self._degrade_to_available()
+        self._cache = ResponseCache(self._config.cache, embed)
         self._bypass = bypass_predicate
         self._hard_signal = hard_signal or default_hard_signal
         self._classifier = classifier
@@ -209,7 +212,18 @@ class Router:
         ``model=`` pins an exact ``provider:model`` (skips routing); ``level=`` pins a tier;
         otherwise the routing brain decides (bypass → hard-signal → strategy/classifier). With
         ``req.tools`` + ``req.tool_executor`` the provider-agnostic tool loop runs underneath.
+
+        A tool-free request may be served from the response cache (returned with zeroed usage +
+        ``cached=True``), skipping routing and the model call entirely.
         """
+        cacheable = self._cache.enabled and not req.tools and req.tool_executor is None
+        cache_key = _cache_key(req, model, level) if cacheable else ""
+        if cacheable:
+            hit = await self._cache.get(cache_key)
+            if hit is not None:
+                for cb in self._on_complete:
+                    cb(hit)
+                return hit
         strat = strategy or self._config.strategy
         decision, prepared = await self._route(req, level=level, model=model, strategy=strat)
         for cb in self._on_route:
@@ -219,6 +233,8 @@ class Router:
         else:
             resp = await self._execute(decision.spec, decision.level, req, decision.classification)
         resp.level_used = decision.level
+        if cacheable:
+            await self._cache.put(cache_key, resp)
         for cb in self._on_complete:
             cb(resp)
         return resp
@@ -518,6 +534,21 @@ def default_hard_signal(req: Request) -> bool:
 
 def _request_text(req: Request) -> str:
     return "\n".join(m.content for m in req.messages if m.content)
+
+
+def _cache_key(req: Request, model: str | ModelSpec | None, level: Level | None) -> str:
+    """A stable key over the salient request parts + any explicit pin — so different content,
+    schemas, web-search flags, media, or pins never collide on a cache hit."""
+    parts = [
+        *(req.system or []),
+        *(f"{m.role}:{m.content}" for m in req.messages),
+        json.dumps(req.response_format, sort_keys=True) if req.response_format else "",
+        f"web_search={req.web_search}",
+        f"media={len(req.media or [])}",
+        f"model={model}",
+        f"level={level}",
+    ]
+    return " ".join(p for p in parts if p)
 
 
 def _approx_tokens(text: str) -> int:

@@ -177,6 +177,7 @@ class Response:
     sources: list[str] = field(default_factory=list)
     classification_usage: Usage | None = None
     usage_records: list[ModelUsage] = field(default_factory=list)  # per-model breakdown
+    cached: bool = False  # served from the response cache — zero new tokens were spent
     raw: Any = None
 
 

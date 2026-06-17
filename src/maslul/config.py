@@ -10,6 +10,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any
 
+from maslul.cache import CacheConfig
 from maslul.errors import ConfigError
 from maslul.types import Level, ModelSpec, Strategy
 
@@ -34,6 +35,8 @@ class RouterConfig:
     retry_base_delay: float = 0.5
     retry_max_delay: float = 8.0
     fallback: bool = True
+    # Response cache (M8): off by default. Semantic mode also needs Router(embed=...).
+    cache: CacheConfig = field(default_factory=CacheConfig)
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> RouterConfig:
@@ -71,6 +74,7 @@ class RouterConfig:
             retry_base_delay=float(root.get("retry_base_delay", 0.5)),
             retry_max_delay=float(root.get("retry_max_delay", 8.0)),
             fallback=bool(root.get("fallback", True)),
+            cache=_cache_config(root.get("cache", {})),
         )
 
     @classmethod
@@ -78,6 +82,17 @@ class RouterConfig:
         """Load and parse a TOML config file (stdlib ``tomllib``)."""
         with open(path, "rb") as f:
             return cls.from_dict(tomllib.load(f))
+
+
+def _cache_config(entry: Mapping[str, Any]) -> CacheConfig:
+    """Parse ``[maslul.cache]`` (mode off/exact/semantic + knobs)."""
+    ttl = entry.get("ttl_seconds")
+    return CacheConfig(
+        mode=str(entry.get("mode", "off")),
+        max_entries=int(entry.get("max_entries", 512)),
+        ttl_seconds=float(ttl) if ttl is not None else None,
+        similarity_threshold=float(entry.get("similarity_threshold", 0.95)),
+    )
 
 
 def _parse_level(value: str | Level) -> Level:

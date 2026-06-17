@@ -345,6 +345,41 @@ def test_from_dict_parses_tiers_and_routing_knobs() -> None:
     assert cfg.tiers[Level.HARD].model == "big"
 
 
+async def test_response_cache_serves_repeat_without_calling_the_model() -> None:
+    config = _config()
+    config["maslul"]["cache"] = {"mode": "exact"}
+    fake = FakeProvider("fake", text="cached hello")
+    router = Router(config, providers={"fake": fake})
+    req = Request(messages=[Message(role="user", content="same question")])
+
+    first = await router.complete(req, level=Level.SIMPLE)
+    assert first.cached is False and len(fake.calls) == 1
+
+    second = await router.complete(req, level=Level.SIMPLE)
+    assert second.text == "cached hello" and second.cached is True
+    assert len(fake.calls) == 1  # served from cache — no second model call
+    assert second.usage.output_tokens == 0  # a hit spent no new tokens
+
+
+async def test_cache_is_bypassed_for_tool_requests() -> None:
+    config = _config()
+    config["maslul"]["cache"] = {"mode": "exact"}
+    fake = FakeProvider("fake")  # returns no tool_calls → the loop ends in one turn
+    router = Router(config, providers={"fake": fake})
+
+    async def _noop(_call: ToolCall) -> str:
+        return "x"
+
+    req = Request(
+        messages=[Message(role="user", content="q")],
+        tools=[ToolDef(name="t", description="", input_schema={"type": "object"})],
+        tool_executor=_noop,
+    )
+    await router.complete(req, level=Level.SIMPLE)
+    await router.complete(req, level=Level.SIMPLE)
+    assert len(fake.calls) == 2  # tool requests are never cached
+
+
 async def test_router_auto_builds_providers_when_none_injected(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
