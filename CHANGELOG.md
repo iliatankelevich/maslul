@@ -8,14 +8,23 @@ All notable changes to **maslul** are documented here. The format follows
 
 ## [0.2.0] - 2026-06-17
 
-Provider capability parity for **web search**, and `CLASSIFY_AND_ANSWER` upgraded to a full turn.
+A fourth provider (OpenAI), web-search parity across all providers, a response cache, graceful
+provider fallback, and `CLASSIFY_AND_ANSWER` upgraded to a full turn.
 
 ### Added
+- **OpenAI provider** (`maslul[openai]`) — text, tool use, structured output, vision, and web
+  search (`web_search_options`) with `url_citation` annotations into `Response.sources`.
 - **Normalized web search across every provider.** Set `Request.web_search=True` (optional
   `web_search_max_uses`) and each provider enables its own grounding — Anthropic's `web_search`
-  server tool, Gemini's Google Search, Grok's Agent Tools `web_search` — with citations normalized
-  into `Response.sources`. The caller never picks a provider-specific mechanism, so swapping the
-  answering model keeps web search working.
+  server tool, Gemini's Google Search, Grok's Agent Tools `web_search`, OpenAI's `web_search_options`
+  — with citations normalized into `Response.sources`. The caller never picks a provider-specific
+  mechanism, so swapping the answering model keeps web search working.
+- **Response cache** (`[maslul.cache]`) — `exact` or `semantic` (nearest request above a cosine
+  threshold, via an injected `Router(embed=...)`); a hit returns with `cached=True` and zeroed usage.
+  Tool-using requests are never cached.
+- **Graceful provider fallback** — `Router(..., missing_provider="degrade")` remaps a tier (or
+  classifier) whose provider isn't configured to the nearest available tier; `build_provider` now
+  raises `ConfigError` when a credential is absent.
 
 ### Changed
 - **`CLASSIFY_AND_ANSWER` is now a full-capability turn.** Its inline answer runs the

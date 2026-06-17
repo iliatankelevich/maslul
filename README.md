@@ -7,13 +7,13 @@
 **Smart LLM router — one call, the right model.**
 
 Async and fully typed, across Anthropic,
-Gemini, and xAI Grok — routing each request to the right model tier by difficulty. Stop
-hardcoding model choices and stop re-writing the tool-use / structured-output / retry plumbing
-for every provider.
+Gemini, xAI Grok, and OpenAI — routing each request to the right model tier by difficulty. Stop
+hardcoding model choices and stop re-writing the tool-use / structured-output / web-search / retry
+plumbing for every provider.
 
 `maslul` (Hebrew *מסלול*, "route / lane") is a small library that does exactly two things:
 **routing** (pick a model tier per request, or pin one) and **provider normalization** (one
-`Request`/`Response` shape for all three SDKs). No server, no CLI, no heavy ML deps — providers
+`Request`/`Response` shape for every SDK). No server, no CLI, no heavy ML deps — providers
 live behind extras, and the core is stdlib-only.
 
 ```python
@@ -38,6 +38,43 @@ pip install "maslul[anthropic,gemini,grok]"     # or just the providers you use
 Each provider's SDK lives behind an extra, so `import maslul` pulls in **none** of them — you
 only install what you route to. `maslul[anthropic]` → `anthropic`; `maslul[gemini]` →
 `google-genai`; `maslul[grok]` → `xai-sdk`; `maslul[openai]` → `openai`.
+
+## How it compares
+
+maslul is **a library, not a gateway** — you embed the routing brain in your app, you don't run a
+proxy in front of it.
+
+| | **maslul** | **RouteLLM** | **LiteLLM** |
+|---|---|---|---|
+| Shape | async library you embed (no server) | research framework / trained router | unified SDK **+ proxy server** |
+| Routing | difficulty **tiers** + swappable strategies (`route_default` / `classify` / `classify_and_answer` / `verify_cascade`) + injectable `bypass` / `classifier` / `verifier` hooks | a **trained** strong-vs-weak router | manual config / fallback lists, load-balancing |
+| Providers | Anthropic · Gemini · Grok · OpenAI, **normalized** | model-agnostic (you wire models) | 100+ providers |
+| Tools / structured / vision | one normalized loop for all | — | per-provider |
+| **Web search** | **one flag, every provider** → `Response.sources` | — | per-provider |
+| Caching | exact **+ semantic** (in-process) | — | exact + semantic (proxy) |
+| Typing / footprint | fully typed, `py.typed`; stdlib core, SDKs behind extras | research code | larger; server to operate |
+
+**Choose maslul when** you want a typed async library you embed — difficulty routing with your own
+strategy + hooks, and one `Request`/`Response` over several providers (tools, structured output,
+vision, **web search**, retries, cost cache) — *without* standing up a gateway. Reach for **LiteLLM**
+when you want a provider proxy across 100+ models, or **RouteLLM** when you specifically want a
+trained router.
+
+## The routing brain
+
+```mermaid
+flowchart LR
+    R["complete(req)"] --> M{"model= pin?"}
+    M -- yes --> RUN["run that model"]
+    M -- no --> L{"level= pin?"}
+    L -- yes --> RUN
+    L -- no --> B{"bypass_predicate?"}
+    B -- "tier" --> RUN
+    B -- "None" --> H{"hard_signal?<br/>(media · code · long · intent verbs)"}
+    H -- "yes" --> HARD["HARD tier"] --> RUN
+    H -- "no" --> S["strategy<br/>route_default · classify ·<br/>classify_and_answer · verify_cascade"] --> RUN
+    RUN --> X["tool loop · web search ·<br/>retry / fallback · usage breakdown"]
+```
 
 ## Routing
 
@@ -123,6 +160,28 @@ Transient errors (`RateLimited`, `Timeout`) retry with exponential backoff; on p
 the request **falls back to the next-higher tier** — which may be a different provider, giving you
 cross-provider failover for free. `AuthError` fails fast. Hooks: `on_route` (the `RoutingDecision`),
 `on_complete` (the final `Response` with `usage_records`), `on_error` (each failed attempt).
+
+Build a router with `missing_provider="degrade"` and any tier whose provider isn't configured
+(e.g. a Grok tier with no `XAI_API_KEY`) **falls back to the nearest available tier** instead of
+erroring — so one config runs across deploys that have different keys.
+
+## Cost cache
+
+A `[maslul.cache]` config returns a prior `Response` instead of calling a model — `exact` (identical
+request) or `semantic` (nearest request above a cosine threshold, using an embedder you inject, since
+maslul ships no embeddings). A hit comes back with `cached=True` and **zeroed usage**, so monitoring
+sees the saving. Tool-using requests are never cached.
+
+```toml
+[maslul.cache]
+mode = "semantic"          # off | exact | semantic
+max_entries = 1000
+ttl_seconds = 86400
+similarity_threshold = 0.95
+```
+```python
+router = Router.from_toml("maslul.toml", embed=my_async_embed)   # embed only needed for semantic
+```
 
 ## Configuration
 
