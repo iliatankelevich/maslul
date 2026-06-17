@@ -44,6 +44,9 @@ build-backend = "hatchling.build"
 [tool.hatch.build.targets.wheel]
 packages = ["src/maslul"]
 
+[tool.hatch.build.targets.sdist]
+exclude = ["docs/assets"]
+
 [tool.ruff]
 line-length = 100
 target-version = "py312"

@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="docs/assets/maslul-logo2.png" alt="maslul" width="700">
+  <img src="https://raw.githubusercontent.com/iliatankelevich/maslul/main/docs/assets/maslul-logo2.png" alt="maslul" width="700">
 </p>
 
 # maslul
