@@ -104,9 +104,9 @@ req = Request(messages=[Message(role="user", content="Extract name + age")],
 req = Request(messages=[Message(role="user", content="What's in this image?")],
               media=[MediaPart(mime_type="image/png", data=png_bytes)])
 
-# Anthropic server-side web search — pause/resume handled for you; citations in resp.sources
-req = Request(messages=[Message(role="user", content="Latest news on X?")],
-              server_tools=[{"type": "web_search_20250305", "name": "web_search"}])
+# Web search — one flag, grounded on ANY provider (Anthropic web_search / Gemini Google Search /
+# Grok Agent Tools); citations land in resp.sources regardless of which model answers.
+req = Request(messages=[Message(role="user", content="Latest news on X?")], web_search=True)
 ```
 
 ## Resilience & observability
@@ -171,9 +171,9 @@ custom wiring.
 
 ## Status
 
-Beta (`0.1.x`), fully typed (`py.typed`), async-first. Routing, tool use, structured output,
-vision, Anthropic server-side web search, the four strategies, and retry/fallback resilience are
-implemented and exercised against live APIs.
+Beta (`0.2.x`), fully typed (`py.typed`), async-first. Routing, tool use, structured output,
+vision, **web search across all three providers** (`web_search=True`), the four strategies, and
+retry/fallback resilience are implemented and exercised against live APIs.
 
 ## License
 

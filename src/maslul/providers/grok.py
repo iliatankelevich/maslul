@@ -21,6 +21,7 @@ from typing import Any
 import grpc
 from xai_sdk import AsyncClient
 from xai_sdk.chat import assistant, chat_pb2, image, system, tool, tool_result, user
+from xai_sdk.tools import web_search
 
 from maslul.errors import AuthError, ProviderError, RateLimited, Timeout
 from maslul.providers._common import last_user_index
@@ -38,11 +39,16 @@ class GrokProvider:
     async def complete(self, spec: ModelSpec, req: Request) -> Response:
         messages = [system(s) for s in (req.system or [])] + _to_messages(req.messages, req.media)
         kwargs: dict[str, Any] = {"model": spec.model, "messages": messages}
-        if req.tools:
-            kwargs["tools"] = [
-                tool(name=t.name, description=t.description, parameters=t.input_schema)
-                for t in req.tools
-            ]
+        # Client function tools + the server-side web_search tool (xAI Agent Tools API; the older
+        # SearchParameters "Live Search" is deprecated/removed). Both are chat_pb2.Tool entries.
+        tools = [
+            tool(name=t.name, description=t.description, parameters=t.input_schema)
+            for t in (req.tools or [])
+        ]
+        if req.web_search:
+            tools.append(web_search())
+        if tools:
+            kwargs["tools"] = tools
         if req.response_format is not None:
             kwargs["response_format"] = chat_pb2.ResponseFormat(
                 format_type=chat_pb2.FormatType.FORMAT_TYPE_JSON_SCHEMA,
@@ -66,6 +72,7 @@ class GrokProvider:
             usage=_usage(getattr(resp, "usage", None)),
             tool_calls=_tool_calls(resp),
             finish_reason=_finish_reason(resp),
+            sources=_sources(resp),
             raw=resp,
         )
 
@@ -142,6 +149,16 @@ def _finish_reason(resp: Any) -> str | None:
     if fr is None:
         return None
     return getattr(fr, "name", None) or str(fr)
+
+
+def _sources(resp: Any) -> list[str]:
+    """Unique citation URLs from xAI Live Search (returned when return_citations is set)."""
+    out: list[str] = []
+    for c in getattr(resp, "citations", None) or []:
+        url = c if isinstance(c, str) else (getattr(c, "url", None) or getattr(c, "uri", None))
+        if url and url not in out:
+            out.append(url)
+    return out
 
 
 def _map_error(e: Exception) -> Exception:

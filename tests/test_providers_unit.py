@@ -386,3 +386,98 @@ async def test_grok_structured_and_media_translation() -> None:
     assert json.loads(rf.schema) == _SCHEMA
     user_msg = kwargs["messages"][-1]
     assert any(c.HasField("image_url") for c in user_msg.content)
+
+
+# --- normalized web search → each provider's native grounding; citations → Response.sources ---
+
+
+async def test_anthropic_web_search_flag_synthesizes_server_tool() -> None:
+    resp = SimpleNamespace(
+        content=[SimpleNamespace(type="text", text="ok")],
+        usage=SimpleNamespace(
+            input_tokens=1,
+            output_tokens=1,
+            cache_read_input_tokens=0,
+            cache_creation_input_tokens=0,
+        ),
+        stop_reason="end_turn",
+    )
+    fake = _FakeAnthropic(resp)
+    await AnthropicProvider(client=fake).complete(
+        ModelSpec(provider="anthropic", model="claude-sonnet-4-6"),
+        Request(
+            messages=[Message(role="user", content="news?")],
+            web_search=True,
+            web_search_max_uses=3,
+        ),
+    )
+    assert {"type": "web_search_20250305", "name": "web_search", "max_uses": 3} in fake.calls[0][
+        "tools"
+    ]
+
+
+async def test_anthropic_web_search_not_double_added_when_passed_raw() -> None:
+    resp = SimpleNamespace(
+        content=[SimpleNamespace(type="text", text="ok")],
+        usage=SimpleNamespace(
+            input_tokens=1,
+            output_tokens=1,
+            cache_read_input_tokens=0,
+            cache_creation_input_tokens=0,
+        ),
+        stop_reason="end_turn",
+    )
+    fake = _FakeAnthropic(resp)
+    await AnthropicProvider(client=fake).complete(
+        ModelSpec(provider="anthropic", model="claude-sonnet-4-6"),
+        Request(
+            messages=[Message(role="user", content="news?")],
+            web_search=True,
+            server_tools=[{"type": "web_search_20250305", "name": "web_search"}],
+        ),
+    )
+    web = [t for t in fake.calls[0]["tools"] if str(t.get("type", "")).startswith("web_search")]
+    assert len(web) == 1  # the flag did not double-add the raw tool
+
+
+async def test_gemini_web_search_adds_google_search_and_maps_sources() -> None:
+    resp = SimpleNamespace(
+        text="grounded",
+        usage_metadata=SimpleNamespace(
+            prompt_token_count=1, candidates_token_count=1, cached_content_token_count=0
+        ),
+        candidates=[
+            SimpleNamespace(
+                finish_reason=SimpleNamespace(name="STOP"),
+                grounding_metadata=SimpleNamespace(
+                    grounding_chunks=[SimpleNamespace(web=SimpleNamespace(uri="https://ex.com/a"))]
+                ),
+            )
+        ],
+    )
+    fake = _FakeGemini(resp)
+    out = await GeminiProvider(client=fake).complete(
+        ModelSpec(provider="gemini", model="gemini-2.5-flash"),
+        Request(messages=[Message(role="user", content="news?")], web_search=True),
+    )
+    cfg = fake.calls[0]["config"]
+    assert any(getattr(t, "google_search", None) is not None for t in cfg.tools)
+    assert out.sources == ["https://ex.com/a"]
+
+
+async def test_grok_web_search_adds_server_tool_and_maps_citations() -> None:
+    resp = SimpleNamespace(
+        content="grounded",
+        tool_calls=[],
+        usage=SimpleNamespace(prompt_tokens=1, completion_tokens=1, cached_prompt_text_tokens=0),
+        finish_reason="stop",
+        citations=["https://ex.com/b", "https://ex.com/b"],  # de-duped
+    )
+    fake = _FakeGrok(resp)
+    out = await GrokProvider(client=fake).complete(
+        ModelSpec(provider="grok", model="grok-4.3"),
+        Request(messages=[Message(role="user", content="news?")], web_search=True),
+    )
+    # xAI Agent Tools API: web_search is a server-side Tool entry (not the deprecated SearchParams).
+    assert any(t.HasField("web_search") for t in fake.calls[0]["tools"])
+    assert out.sources == ["https://ex.com/b"]

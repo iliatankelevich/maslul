@@ -192,6 +192,52 @@ async def test_classify_and_answer_escalates_on_sentinel() -> None:
     assert {r.model for r in resp.usage_records} == {"floor", "big"}
 
 
+async def test_classify_and_answer_runs_tool_loop() -> None:
+    # The inline answer is a FULL turn: the cheap model asks for a tool, the router executes it
+    # and feeds the result back, and the model answers — tools are not dropped.
+    provider = ScriptedProvider(
+        "fake",
+        [
+            Response(
+                text="",
+                level_used=None,
+                provider="fake",
+                model="floor",
+                usage=Usage(input_tokens=3, output_tokens=2),
+                tool_calls=[ToolCall(id="c1", name="add", input={"a": 2, "b": 3})],
+            ),
+            Response(
+                text="It's 5.",
+                level_used=None,
+                provider="fake",
+                model="floor",
+                usage=Usage(input_tokens=4, output_tokens=1),
+            ),
+        ],
+    )
+    router = Router(
+        _classify_config("classify_and_answer", classifier_model="floor"),
+        providers={"fake": provider},
+    )
+    executed: list[ToolCall] = []
+
+    async def executor(call: ToolCall) -> str:
+        executed.append(call)
+        return "5"
+
+    req = Request(
+        messages=[Message(role="user", content="2+3?")],
+        tools=[ToolDef(name="add", description="add", input_schema={"type": "object"})],
+        tool_executor=executor,
+    )
+    resp = await router.complete(req)
+    assert resp.text == "It's 5."  # answered via the tool loop, not a single bare call
+    assert [c.name for c in executed] == ["add"]  # the tool actually ran
+    assert [c.name for c in resp.tool_calls] == ["add"]
+    assert resp.usage.output_tokens == 3  # 2 + 1 accumulated across the seeded loop
+    assert resp.level_used is None  # answered inline
+
+
 async def test_classify_without_classifier_config_raises() -> None:
     config = _config()
     config["maslul"]["strategy"] = "classify"

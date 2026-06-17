@@ -24,6 +24,13 @@ from maslul.types import MediaPart, Message, ModelSpec, Request, Response, ToolC
 _DEFAULT_MAX_TOKENS = 1024
 # Guard against a runaway server-side-tool (web search) resume loop.
 _MAX_SERVER_TOOL_TURNS = 10
+# Anthropic's server-side web search tool type (versioned).
+_WEB_SEARCH_TOOL = "web_search_20250305"
+
+
+def _has_web_search(server_tools: list[dict[str, Any]] | None) -> bool:
+    """True if a raw web_search server tool was already supplied (avoid double-adding)."""
+    return any(str(t.get("type", "")).startswith("web_search") for t in (server_tools or []))
 
 
 class AnthropicProvider:
@@ -49,6 +56,13 @@ class AnthropicProvider:
             for t in (req.tools or [])
         ]
         tools += list(req.server_tools or [])
+        # Normalized web search → Anthropic's server-side web_search tool (unless the caller already
+        # passed one raw via server_tools, for back-compat).
+        if req.web_search and not _has_web_search(req.server_tools):
+            web: dict[str, Any] = {"type": _WEB_SEARCH_TOOL, "name": "web_search"}
+            if req.web_search_max_uses is not None:
+                web["max_uses"] = req.web_search_max_uses
+            tools.append(web)
         if tools:
             kwargs["tools"] = tools
         if req.system:

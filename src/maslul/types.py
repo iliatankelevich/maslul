@@ -127,6 +127,11 @@ class Request:
     # Raw provider-native server-side tool specs (e.g. Anthropic web search) the provider runs
     # itself — no client executor. Merged alongside ``tools``; unsupported providers ignore them.
     server_tools: list[dict[str, Any]] | None = None
+    # Normalized web search: set ``web_search=True`` and every provider enables its own grounding
+    # (Anthropic web_search tool, Gemini Google Search, Grok Live Search) — the caller doesn't pick
+    # a provider-specific mechanism. Citations land in :attr:`Response.sources` uniformly.
+    web_search: bool = False
+    web_search_max_uses: int | None = None  # cap searches/turn where the provider supports it
     response_format: JsonSchema | None = None
     media: list[MediaPart] | None = None
     max_tokens: int | None = None

@@ -254,6 +254,44 @@ async def test_grok_vision_live() -> None:
     await _vision_round_trip("grok", GrokProvider(), os.getenv("MASLUL_GROK_MODEL", "grok-4.3"))
 
 
+# --- web search parity (live, per provider) ----------------------------------------------
+# The whole point of the normalized flag: one `web_search=True` grounds the answer on EVERY
+# provider (Anthropic web_search tool / Gemini Google Search / Grok Live Search), citations in
+# Response.sources — so the caller never picks a provider-specific mechanism.
+
+
+async def _web_search_round_trip(provider_name: str, provider: Any, model: str) -> None:
+    router = _router(provider_name, provider, model)
+    req = Request(
+        messages=[
+            Message(role="user", content="Who is the current CEO of OpenAI? Cite your source.")
+        ],
+        web_search=True,
+        max_tokens=1024,
+    )
+    resp = await router.complete(req, level=Level.HARD)
+    assert resp.text.strip()
+    assert resp.sources, f"expected grounding sources, got none: {resp.text!r}"
+
+
+@requires_gemini
+async def test_gemini_web_search_live() -> None:
+    from maslul.providers.gemini import GeminiProvider
+
+    project = os.getenv("MASLUL_VERTEX_PROJECT") or os.getenv("GOOGLE_CLOUD_PROJECT")
+    provider = GeminiProvider(vertex_project=project)
+    await _web_search_round_trip(
+        "gemini", provider, os.getenv("MASLUL_GEMINI_MODEL", "gemini-2.5-flash")
+    )
+
+
+@requires_grok
+async def test_grok_web_search_live() -> None:
+    from maslul.providers.grok import GrokProvider
+
+    await _web_search_round_trip("grok", GrokProvider(), os.getenv("MASLUL_GROK_MODEL", "grok-4.3"))
+
+
 # --- M4: classify strategies (live, Anthropic) -------------------------------------------
 # A cheap haiku classifier with a sonnet HARD tier — also a real two-model usage breakdown.
 
@@ -348,8 +386,8 @@ async def test_anthropic_verify_cascade_live() -> None:
 
 @requires_anthropic
 async def test_anthropic_web_search_live() -> None:
-    """Server-side web search: the turn pauses mid-search; maslul must resume it (not return a
-    truncated pause_turn) and surface the citations."""
+    """Server-side web search via the normalized ``web_search`` flag: the turn pauses mid-search;
+    maslul must resume it (not return a truncated pause_turn) and surface the citations."""
     from maslul.providers.anthropic import AnthropicProvider
 
     model = os.getenv("MASLUL_ANTHROPIC_MODEL", "claude-sonnet-4-6")
@@ -362,7 +400,8 @@ async def test_anthropic_web_search_live() -> None:
                 "then answer in one short sentence.",
             )
         ],
-        server_tools=[{"type": "web_search_20250305", "name": "web_search", "max_uses": 3}],
+        web_search=True,
+        web_search_max_uses=3,
         max_tokens=1024,
     )
     resp = await router.complete(req, level=Level.HARD)

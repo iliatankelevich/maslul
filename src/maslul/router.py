@@ -176,8 +176,8 @@ class Router:
         decision, prepared = await self._route(req, level=level, model=model, strategy=strat)
         for cb in self._on_route:
             cb(req, decision)
-        if prepared is not None:  # CLASSIFY_AND_ANSWER answered inline
-            resp = self._finalize(req, prepared, _ledger_of(prepared))
+        if prepared is not None:  # a strategy answered inline (already finalized)
+            resp = prepared
         else:
             resp = await self._execute(decision.spec, decision.level, req, decision.classification)
         resp.level_used = decision.level
@@ -279,20 +279,30 @@ class Router:
         return RoutingDecision(self._spec_for_level(level), level, "classify", record)
 
     async def _classify_and_answer(self, req: Request) -> tuple[RoutingDecision, Response | None]:
-        """CLASSIFY_AND_ANSWER: one call to the classifier model. It either answers directly, or
-        emits the escalation sentinel — then we re-dispatch the original request to a stronger
-        tier."""
+        """CLASSIFY_AND_ANSWER: the classifier model gets the *full-capability* turn — it answers
+        directly (running the tool loop and any web search, exactly like a normal turn) or emits the
+        escalation sentinel on its first response, in which case we re-dispatch the original request
+        to a stronger tier. The escalate-or-answer decision is read from that first response before
+        any tools run; an answer then continues the tool loop seeded by it (no extra model call)."""
         spec = self._require_classifier()
         provider = self._provider_for(spec)
         guided = replace(req, system=[_CLASSIFY_AND_ANSWER_GUIDANCE, *(req.system or [])])
-        resp = await provider.complete(spec, guided)
-        target = _parse_escalation(resp.text)
+        first = await self._invoke(provider, spec, guided)
+        target = _parse_escalation(first.text)
         if target is not None:  # declined → escalate; the classifier call still cost tokens
-            record = ModelUsage(spec.provider, spec.model, resp.usage)
+            record = ModelUsage(spec.provider, spec.model, first.usage)
             decision = RoutingDecision(
                 self._spec_for_level(target), target, "classify_and_answer:escalate", record
             )
             return decision, None
+        # Answered: finish the turn at this tier — drive the tool loop if client tools are in play.
+        ledger: dict[tuple[str, str], Usage] = {}
+        if req.tools and req.tool_executor is not None:
+            resp = await self._run_tool_loop(spec, provider, req, ledger, seed=first)
+        else:
+            resp = first
+            _record(ledger, resp)
+        resp = self._finalize(req, resp, ledger)
         return RoutingDecision(spec, None, "classify_and_answer:answered"), resp
 
     async def _execute(
@@ -391,12 +401,18 @@ class Router:
         provider: Provider,
         req: Request,
         ledger: dict[tuple[str, str], Usage],
+        *,
+        seed: Response | None = None,
     ) -> Response:
+        """Drive the provider-agnostic tool loop. ``seed`` is an already-fetched first response
+        (e.g. CLASSIFY_AND_ANSWER's answer turn) — used as turn 1 instead of making a fresh call."""
         assert req.tool_executor is not None
         messages = list(req.messages)
         executed: list[ToolCall] = []
+        resp = seed
         for _ in range(_MAX_TOOL_ITERATIONS):
-            resp = await self._invoke(provider, spec, replace(req, messages=messages))
+            if resp is None:
+                resp = await self._invoke(provider, spec, replace(req, messages=messages))
             _record(ledger, resp)
             if not resp.tool_calls:
                 resp.tool_calls = executed  # surface the full tool I/O of the turn
@@ -410,6 +426,7 @@ class Router:
                 messages.append(
                     Message(role="tool", content=result, tool_call_id=call.id, name=call.name)
                 )
+            resp = None
         raise ProviderError(f"tool loop exceeded {_MAX_TOOL_ITERATIONS} iterations")
 
     def _require_classifier(self) -> ModelSpec:
@@ -490,12 +507,6 @@ def _parse_escalation(text: str) -> Level | None:
     if match is None:
         return None
     return _LEVEL_BY_NAME.get(match.group(1).lower(), Level.HARD)
-
-
-def _ledger_of(resp: Response) -> dict[tuple[str, str], Usage]:
-    ledger: dict[tuple[str, str], Usage] = {}
-    _record(ledger, resp)
-    return ledger
 
 
 def _record(ledger: dict[tuple[str, str], Usage], resp: Response) -> None:

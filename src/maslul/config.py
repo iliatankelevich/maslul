@@ -1,5 +1,5 @@
 """Router configuration — parsed from a plain dict (OSS users) or a TOML file
-(Kippy-style ``maslul.toml``). The shape mirrors §5 of the implementation plan.
+(``maslul.toml``). The shape mirrors §5 of the implementation plan.
 """
 
 from __future__ import annotations

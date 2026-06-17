@@ -58,8 +58,9 @@ class GeminiProvider:
         if req.response_format is not None:
             config["response_mime_type"] = "application/json"
             config["response_json_schema"] = req.response_format
+        tools: list[Any] = []
         if req.tools:
-            config["tools"] = [
+            tools.append(
                 types.Tool(
                     function_declarations=[
                         types.FunctionDeclaration(
@@ -70,7 +71,13 @@ class GeminiProvider:
                         for t in req.tools
                     ]
                 )
-            ]
+            )
+        # Normalized web search → Gemini's Google Search grounding. NB: some models reject
+        # google_search combined with function_declarations in one request — verify per model.
+        if req.web_search:
+            tools.append(types.Tool(google_search=types.GoogleSearch()))
+        if tools:
+            config["tools"] = tools
         try:
             resp = await self._client.aio.models.generate_content(
                 model=spec.model,
@@ -87,6 +94,7 @@ class GeminiProvider:
             usage=_usage(getattr(resp, "usage_metadata", None)),
             tool_calls=_tool_calls(resp),
             finish_reason=_finish_reason(resp),
+            sources=_sources(resp),
             raw=resp,
         )
 
@@ -163,6 +171,20 @@ def _finish_reason(resp: Any) -> str | None:
     if fr is None:
         return None
     return getattr(fr, "name", None) or str(fr)
+
+
+def _sources(resp: Any) -> list[str]:
+    """Unique grounding URLs from Google Search grounding metadata (web search citations)."""
+    candidates = getattr(resp, "candidates", None) or []
+    if not candidates:
+        return []
+    gm = getattr(candidates[0], "grounding_metadata", None)
+    urls: list[str] = []
+    for chunk in getattr(gm, "grounding_chunks", None) or []:
+        uri = getattr(getattr(chunk, "web", None), "uri", None)
+        if uri and uri not in urls:
+            urls.append(uri)
+    return urls
 
 
 def _map_error(e: Exception) -> Exception:

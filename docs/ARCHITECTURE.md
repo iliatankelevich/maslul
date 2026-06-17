@@ -59,7 +59,7 @@ Every provider speaks the same `Request` → `Response`:
 
 ```python
 Request(messages, system, tools, tool_executor, response_format, media, server_tools,
-        max_tokens, temperature, stop, provider_options, metadata)
+        web_search, web_search_max_uses, max_tokens, temperature, stop, provider_options, metadata)
 
 Response(text, level_used, provider, model, usage, structured, tool_calls, finish_reason,
          sources, classification_usage, usage_records, raw)
@@ -128,14 +128,21 @@ class Provider(Protocol):
   the model, surface `tool_calls`, run `req.tool_executor`, append the results as normalized
   messages, repeat until the model stops (bounded by an iteration guard). Because it works on
   *normalized* messages, the same loop drives all three providers.
-- **Server-side tools** (Anthropic web search) are resolved **inside the provider**, because resuming
-  a paused turn requires echoing back the provider's *raw* assistant content — which the normalized
-  loop deliberately doesn't carry. `AnthropicProvider` loops on `stop_reason == "pause_turn"`,
-  accumulates usage across resumes, and collects citations into `Response.sources`. Server tools are
-  passed as raw specs via `Request.server_tools` and merged with the translated client tools.
+- **Server-side tools** (web search) are resolved **inside the provider**. The normalized way to ask
+  for it is **`Request.web_search=True`** — every provider then enables its own grounding and
+  normalizes citations into `Response.sources`, so the caller never picks a provider-specific
+  mechanism (swap the answering model and search keeps working):
+  - `anthropic` → the `web_search` server tool; loops on `stop_reason == "pause_turn"`, echoing back
+    the raw assistant content (which the normalized loop deliberately doesn't carry) and accumulating
+    usage across resumes.
+  - `gemini` → a `google_search` grounding `Tool`; sources from the grounding metadata.
+  - `grok` → the xAI Agent Tools `web_search` tool; sources from the response citations.
+  The raw `Request.server_tools` passthrough remains for advanced Anthropic-specific specs.
 
 The two compose: a single `provider.complete` call resolves any web searches internally, then
-returns either a client `tool_use` (which the Router loop handles) or the final answer.
+returns either a client `tool_use` (which the Router loop handles) or the final answer. The
+`CLASSIFY_AND_ANSWER` strategy's inline answer runs that same Router loop, so the cheap answerer is a
+full-capability turn (client tools + web search), still able to escalate via the sentinel.
 
 Each provider also normalizes: messages/system, tool defs + the call/result round-trip, structured
 output (`response_format` → `Response.structured`), vision (`MediaPart` image/PDF), token `Usage`
@@ -144,9 +151,9 @@ on them.
 
 | Provider | SDK | Auth | Notes |
 |---|---|---|---|
-| `anthropic` | `anthropic` | `ANTHROPIC_API_KEY` | server-side web search, prompt caching via `provider_options` |
-| `gemini` | `google-genai` | Vertex AI + ADC, or API key | `function_call`/`function_response`, `response_json_schema` |
-| `grok` | `xai-sdk` (gRPC) | `XAI_API_KEY` | stateful chat reconstructed from normalized messages each turn |
+| `anthropic` | `anthropic` | `ANTHROPIC_API_KEY` | `web_search` server tool (pause/resume), prompt caching via `provider_options` |
+| `gemini` | `google-genai` | Vertex AI + ADC, or API key | `function_call`/`function_response`, `response_json_schema`, `google_search` grounding |
+| `grok` | `xai-sdk` (gRPC) | `XAI_API_KEY` | stateful chat reconstructed each turn; Agent Tools `web_search` |
 
 ---
 
