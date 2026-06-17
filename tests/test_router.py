@@ -288,6 +288,55 @@ async def test_missing_provider_raises_config_error() -> None:
         await router.complete(_req(), level=Level.HARD)
 
 
+def _grok_heavy_config() -> dict[str, Any]:
+    return {
+        "maslul": {
+            "strategy": "classify_and_answer",
+            "default_level": "medium",
+            "classifier": {"provider": "grok", "model": "g-classify"},
+            "tiers": {
+                "simple": {"provider": "grok", "model": "g-small"},
+                "medium": {"provider": "grok", "model": "g-mid"},
+                "hard": {"provider": "fake", "model": "big"},
+            },
+        }
+    }
+
+
+async def test_degrade_remaps_unavailable_tiers_and_drops_classifier() -> None:
+    # Only "fake" is available; the grok tiers + grok classifier must degrade gracefully.
+    router = Router(
+        _grok_heavy_config(),
+        providers={"fake": FakeProvider("fake")},
+        missing_provider="degrade",
+    )
+    cfg = router.config
+    # grok tiers remap to the nearest available higher tier (HARD = fake:big)
+    assert (cfg.tiers[Level.SIMPLE].provider, cfg.tiers[Level.SIMPLE].model) == ("fake", "big")
+    assert cfg.tiers[Level.MEDIUM].model == "big"
+    assert cfg.tiers[Level.HARD].model == "big"
+    assert cfg.classifier is None  # the grok classifier is dropped …
+    assert cfg.strategy is Strategy.ROUTE_DEFAULT  # … and the strategy downgrades
+    resp = await router.complete(_req())  # routes without crashing
+    assert resp.provider == "fake"
+
+
+async def test_degrade_raises_when_no_tier_is_available() -> None:
+    with pytest.raises(ConfigError, match="no configured tier"):
+        Router(
+            _grok_heavy_config(),
+            providers={"other": FakeProvider("other")},
+            missing_provider="degrade",
+        )
+
+
+async def test_error_mode_is_the_default_and_keeps_config_intact() -> None:
+    router = Router(_grok_heavy_config(), providers={"fake": FakeProvider("fake")})
+    assert router.config.tiers[Level.SIMPLE].provider == "grok"  # untouched
+    with pytest.raises(ConfigError):  # missing grok surfaces at call time
+        await router.complete(_req(), level=Level.SIMPLE)
+
+
 def test_from_dict_parses_tiers_and_routing_knobs() -> None:
     cfg = Router(_config(), providers={"fake": FakeProvider("fake")}).config
     assert cfg.strategy is Strategy.ROUTE_DEFAULT

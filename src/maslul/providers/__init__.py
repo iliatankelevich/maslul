@@ -33,19 +33,29 @@ def build_provider(name: str, config: Mapping[str, Any]) -> Provider:
     if name == "anthropic":
         from maslul.providers.anthropic import AnthropicProvider
 
-        return AnthropicProvider(api_key=_env(config.get("api_key_env")))
+        key = _env(config.get("api_key_env")) or os.environ.get("ANTHROPIC_API_KEY")
+        if not key:
+            raise ConfigError("anthropic not configured (set api_key_env or ANTHROPIC_API_KEY)")
+        return AnthropicProvider(api_key=key)
     if name == "gemini":
         from maslul.providers.gemini import GeminiProvider
 
+        project = config.get("vertex_project")
+        key = _env(config.get("api_key_env")) or os.environ.get("GOOGLE_API_KEY")
+        if not project and not key:
+            raise ConfigError("gemini not configured (set vertex_project or an api key)")
         return GeminiProvider(
-            vertex_project=config.get("vertex_project"),
+            vertex_project=project,
             vertex_location=config.get("vertex_location", "global"),
-            api_key=_env(config.get("api_key_env")),
+            api_key=key,
         )
     if name == "grok":
         from maslul.providers.grok import GrokProvider
 
-        return GrokProvider(api_key=_env(config.get("api_key_env")))
+        key = _env(config.get("api_key_env")) or os.environ.get("XAI_API_KEY")
+        if not key:
+            raise ConfigError("grok not configured (set api_key_env or XAI_API_KEY)")
+        return GrokProvider(api_key=key)
     raise ConfigError(f"unknown provider {name!r} — expected one of {sorted(KNOWN_PROVIDERS)}")
 
 

@@ -153,7 +153,14 @@ async def test_build_provider_dispatches_by_name(monkeypatch: pytest.MonkeyPatch
 
 def test_build_provider_unknown_raises() -> None:
     with pytest.raises(ConfigError):
-        build_provider("openai", {})
+        build_provider("cohere", {})
+
+
+def test_build_provider_unconfigured_raises(monkeypatch: pytest.MonkeyPatch) -> None:
+    # No api_key_env and no fallback env var → ConfigError (so degrade mode can skip it).
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    with pytest.raises(ConfigError, match="anthropic not configured"):
+        build_provider("anthropic", {})
 
 
 # --- tool-use translation (M2) -----------------------------------------------------------

@@ -105,6 +105,7 @@ class Router:
         config: RouterConfig | Mapping[str, Any],
         providers: Mapping[str, Provider] | None = None,
         *,
+        missing_provider: str = "error",
         bypass_predicate: BypassPredicate | None = None,
         hard_signal: HardSignal | None = None,
         classifier: Classifier | None = None,
@@ -113,15 +114,19 @@ class Router:
         on_complete: CompleteHook | None = None,
         on_error: ErrorHook | None = None,
     ) -> None:
+        """``missing_provider`` controls what happens when a tier (or the classifier) references a
+        provider that can't be used — its credentials aren't configured, or its injected instance
+        is absent. ``"error"`` (default) surfaces it; ``"degrade"`` remaps each such tier to the
+        nearest available tier and drops an unavailable classifier (downgrading a classify strategy)
+        — so a deploy runs with only the providers it actually configured."""
         self._config = (
             config if isinstance(config, RouterConfig) else RouterConfig.from_dict(config)
         )
         if providers is None:
-            providers = {
-                name: build_provider(name, self._config.providers.get(name, {}))
-                for name in self._provider_names()
-            }
+            providers = self._auto_build(missing_provider == "degrade")
         self._providers: dict[str, Provider] = dict(providers)
+        if missing_provider == "degrade":
+            self._degrade_to_available()
         self._bypass = bypass_predicate
         self._hard_signal = hard_signal or default_hard_signal
         self._classifier = classifier
@@ -139,8 +144,41 @@ class Router:
         **hooks: Any,
     ) -> Router:
         """Build a router from a TOML config file. Omit ``providers`` to auto-build them from
-        the ``[maslul.providers.*]`` config; pass routing/observability hooks as keywords."""
+        the ``[maslul.providers.*]`` config; pass routing/observability hooks (and
+        ``missing_provider``) as keywords."""
         return cls(RouterConfig.from_toml(path), providers, **hooks)
+
+    def _auto_build(self, degrade: bool) -> dict[str, Provider]:
+        """Build the providers referenced by the tiers/classifier from ``[maslul.providers.*]``.
+        In ``degrade`` mode an unbuildable provider (missing credential or SDK) is skipped rather
+        than raised."""
+        built: dict[str, Provider] = {}
+        for name in self._provider_names():
+            try:
+                built[name] = build_provider(name, self._config.providers.get(name, {}))
+            except (ConfigError, ImportError):
+                if not degrade:
+                    raise
+        return built
+
+    def _degrade_to_available(self) -> None:
+        """Remap any tier whose provider isn't available to the nearest available tier (escalating),
+        and drop an unavailable classifier (downgrading a classify strategy to route_default)."""
+        available = set(self._providers)
+        tiers = self._config.tiers
+        usable = {lvl: spec for lvl, spec in tiers.items() if spec.provider in available}
+        if not usable:
+            raise ConfigError("no configured tier has an available provider")
+        for level in list(tiers):
+            if tiers[level].provider in available:
+                continue
+            higher = [lvl for lvl in usable if lvl > level]
+            tiers[level] = usable[min(higher)] if higher else usable[max(usable)]
+        classifier = self._config.classifier
+        if classifier is not None and classifier.provider not in available:
+            self._config.classifier = None
+            if self._config.strategy in (Strategy.CLASSIFY, Strategy.CLASSIFY_AND_ANSWER):
+                self._config.strategy = Strategy.ROUTE_DEFAULT
 
     def on_route(self, callback: RouteHook) -> None:
         """Register a callback fired with ``(request, RoutingDecision)`` before each model call."""
