@@ -94,6 +94,53 @@ class MediaPart:
 
 
 @dataclass
+class ContextCache:
+    """Declares which parts of a request are stable enough for a provider to reuse across calls.
+
+    **This is prompt caching, not the response cache.** The response cache (``[maslul.cache]``,
+    :mod:`maslul.cache`) answers *without calling the model at all*. A ``ContextCache`` still calls
+    the model — it just asks the provider to bill the part of the prompt it has already seen at the
+    cache-read rate (~0.1x on Anthropic). Different layer, and they compose.
+
+    A **hint, not a command**: the caller declares *what is stable and for how long*, never a
+    mechanism. Anthropic honours it with explicit ``cache_control`` breakpoints; Gemini, OpenAI and
+    Grok cache a matching prefix automatically and honour it through **prompt layout** (stable
+    content first) plus, where available, an affinity key. A provider that can do nothing with a
+    field ignores it — the request still succeeds, it just costs full price. Savings are always
+    reported the same way, in ``Usage.cache_read_input_tokens``.
+
+    ⚠️ **The cache is model-scoped; the router picks the model.** A cache written on the ``simple``
+    tier is cold on ``hard``, so an escalating strategy (``CLASSIFY_AND_ANSWER``,
+    ``VERIFY_CASCADE``, or tier fallback) can pay the write premium twice for nothing. Pair
+    ``media=True`` with a pinned model (``complete(req, model=...)`` or ``level=...``); the router
+    does **not** second-guess you.
+
+    ⚠️ **Any byte that changes early invalidates everything after it**, on every provider. A
+    timestamp or a per-request id in ``system`` — or a tool set that varies per user — silently
+    kills every downstream hit. Verify with ``Usage.cache_read_input_tokens``, not by inspection.
+    """
+
+    #: Cache the system prefix (persona + guidance). On Anthropic this also covers **tools**, which
+    #: render before system. Cheap to re-write, so it stays on even when the model may escalate.
+    system: bool = True
+    #: Cache attached media — the expensive one (a 100k-token PDF). Also **moves media to the first
+    #: user message** so it sits in the stable prefix rather than the most volatile slot; that is a
+    #: behaviour change, which is why it is opt-in. Pair with a pinned model (see above).
+    media: bool = False
+    #: Cache the conversation prefix, for long multi-turn chats.
+    history: bool = False
+    #: ``None`` = the provider's default (Anthropic 5 min, OpenAI ~5–10 min). ``>= 3600`` opts into
+    #: Anthropic's 1-hour TTL (2x write premium instead of 1.25x) and OpenAI's 24-hour retention.
+    ttl_seconds: int | None = None
+    #: Affinity key — a stable per-conversation or per-document id, routing like prompts to the
+    #: same cache. Used by OpenAI (``prompt_cache_key``). **Ignored by Anthropic, Gemini and
+    #: Grok**, which expose no such knob (see the provider docstrings). OpenAI needs roughly
+    #: 15 req/min on a key to keep it warm, so a per-document key is useful, a per-message key is
+    #: not.
+    key: str | None = None
+
+
+@dataclass
 class ToolDef:
     """A tool the model may call: a name, a description, and a JSON-Schema input."""
 
@@ -134,6 +181,10 @@ class Request:
     web_search_max_uses: int | None = None  # cap searches/turn where the provider supports it
     response_format: JsonSchema | None = None
     media: list[MediaPart] | None = None
+    # Prompt caching (NOT the response cache — see ContextCache). Declares which parts of this
+    # request are stable enough for the provider to reuse. ``None`` = today's behaviour, byte for
+    # byte: no cache markers, no affinity key, and media stays on the last user message.
+    context_cache: ContextCache | None = None
     max_tokens: int | None = None
     temperature: float | None = None
     stop: list[str] | None = None
@@ -143,7 +194,21 @@ class Request:
 
 @dataclass
 class Usage:
-    """Token accounting, normalized across providers (cache fields are 0 when N/A)."""
+    """Token accounting, normalized across providers (cache fields are 0 when N/A).
+
+    **The three input fields are disjoint** — each names a different *price*, so cost is one
+    formula on every provider:
+
+    - ``input_tokens`` — tokens billed at **full** price.
+    - ``cache_read_input_tokens`` — tokens billed at the **discounted** cache-read price (~0.1x).
+    - ``cache_creation_input_tokens`` — tokens billed at the **write premium** (Anthropic only).
+
+    The prompt's true size is their **sum**; never add ``cache_read`` to ``input_tokens`` expecting
+    a total-cost figure. Providers disagree natively — Anthropic reports ``input_tokens`` excluding
+    cached tokens, while OpenAI, Grok and Gemini report a prompt total that *includes* them —
+    so maslul subtracts the cached count on those three (``providers._common.split_input``) and
+    normalizes on Anthropic's shape, the one that maps to money.
+    """
 
     input_tokens: int = 0
     output_tokens: int = 0

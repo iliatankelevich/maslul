@@ -17,10 +17,21 @@ import openai
 from openai import AsyncOpenAI
 
 from maslul.errors import AuthError, ProviderError, RateLimited, Timeout
-from maslul.providers._common import last_user_index
-from maslul.types import MediaPart, Message, ModelSpec, Request, Response, ToolCall, Usage
+from maslul.providers._common import media_first, media_index, split_input
+from maslul.types import (
+    ContextCache,
+    MediaPart,
+    Message,
+    ModelSpec,
+    Request,
+    Response,
+    ToolCall,
+    Usage,
+)
 
 _DEFAULT_MAX_TOKENS = 1024
+# ``ttl_seconds`` at or above this opts into OpenAI's extended (24-hour) cache retention.
+_LONG_TTL_SECONDS = 3600
 
 
 class OpenAIProvider:
@@ -34,7 +45,7 @@ class OpenAIProvider:
         self._client: Any = client or (AsyncOpenAI(api_key=api_key) if api_key else AsyncOpenAI())
 
     async def complete(self, spec: ModelSpec, req: Request) -> Response:
-        messages = _to_messages(req.messages, req.media)
+        messages = _to_messages(req.messages, req.media, req.context_cache)
         if req.system:
             messages = [{"role": "system", "content": "\n\n".join(req.system)}, *messages]
         kwargs: dict[str, Any] = {
@@ -65,6 +76,15 @@ class OpenAIProvider:
             kwargs["stop"] = req.stop
         if req.web_search:  # search-capable models only (e.g. gpt-4o-search-preview)
             kwargs["web_search_options"] = {}
+        # Prompt caching. OpenAI caches a matching prefix automatically — the stable-first ordering
+        # in _to_messages is what earns the hit. The affinity key just routes like prompts to the
+        # same cache; ttl opts into extended retention.
+        cache = req.context_cache
+        if cache is not None:
+            if cache.key is not None:
+                kwargs["prompt_cache_key"] = cache.key
+            if cache.ttl_seconds is not None and cache.ttl_seconds >= _LONG_TTL_SECONDS:
+                kwargs["prompt_cache_retention"] = "24h"
         kwargs.update(spec.options)
         kwargs.update(req.provider_options)
         try:
@@ -93,10 +113,15 @@ class OpenAIProvider:
         )
 
 
-def _to_messages(messages: list[Message], media: list[MediaPart] | None) -> list[dict[str, Any]]:
+def _to_messages(
+    messages: list[Message],
+    media: list[MediaPart] | None,
+    cache: ContextCache | None = None,
+) -> list[dict[str, Any]]:
     """Normalized messages → OpenAI's shape. ``media`` is attached to the last user message as
-    ``image_url`` parts; tool results become ``role="tool"`` messages keyed by ``tool_call_id``."""
-    media_at = last_user_index(messages) if media else -1
+    ``image_url`` parts — or the **first** when ``ContextCache(media=True)`` moves it into the
+    cacheable prefix; tool results become ``role="tool"`` messages keyed by ``tool_call_id``."""
+    media_at = media_index(messages, media, cache)
     out: list[dict[str, Any]] = []
     for i, m in enumerate(messages):
         if m.role == "tool":
@@ -117,10 +142,11 @@ def _to_messages(messages: list[Message], media: list[MediaPart] | None) -> list
                 }
             )
         elif i == media_at and media:
-            content: list[dict[str, Any]] = (
-                [{"type": "text", "text": m.content}] if m.content else []
-            )
-            content += [_image_part(p) for p in media]
+            text = [{"type": "text", "text": m.content}] if m.content else []
+            parts = [_image_part(p) for p in media]
+            # Media before the text when caching it, so the volatile question stays out of the
+            # cacheable prefix (see _common.media_first).
+            content = [*parts, *text] if media_first(cache) else [*text, *parts]
             out.append({"role": m.role, "content": content})
         else:
             out.append({"role": m.role, "content": m.content})
@@ -152,13 +178,19 @@ def _tool_calls(message: Any) -> list[ToolCall]:
 
 
 def _usage(u: Any) -> Usage:
+    """``prompt_tokens`` is cached-**inclusive** on OpenAI; maslul's convention is disjoint, so the
+    cached count is subtracted back out (see :class:`~maslul.Usage`)."""
     if u is None:
         return Usage()
     details = getattr(u, "prompt_tokens_details", None)
+    billable, cached = split_input(
+        getattr(u, "prompt_tokens", 0) or 0,
+        getattr(details, "cached_tokens", 0) or 0,
+    )
     return Usage(
-        input_tokens=getattr(u, "prompt_tokens", 0) or 0,
+        input_tokens=billable,
         output_tokens=getattr(u, "completion_tokens", 0) or 0,
-        cache_read_input_tokens=getattr(details, "cached_tokens", 0) or 0,
+        cache_read_input_tokens=cached,
     )
 
 

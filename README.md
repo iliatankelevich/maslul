@@ -183,6 +183,49 @@ similarity_threshold = 0.95
 router = Router.from_toml("maslul.toml", embed=my_async_embed)   # embed only needed for semantic
 ```
 
+## Prompt caching
+
+A different lever from the cost cache above, and they compose: the cost cache **doesn't call the
+model**; prompt caching **calls it, but pays ~0.1×** for the part of the prompt it has already seen.
+Ask a second question about a 100k-token PDF and you re-send the whole PDF — Anthropic will serve it
+from cache for a tenth of the price, but only if you tell it what's stable.
+
+You declare **what is stable**, never a mechanism. Anthropic gets explicit `cache_control`
+breakpoints; Gemini, OpenAI and Grok cache a matching *prefix* automatically, so what they need is
+**layout** — and that's the one lever that works on all four:
+
+```python
+from maslul import ContextCache, MediaPart, Message, Request
+
+req = Request(
+    messages=[Message(role="user", content="What does clause 4 say?")],
+    system=[PERSONA],
+    media=[MediaPart(mime_type="application/pdf", data=pdf_bytes)],
+    context_cache=ContextCache(media=True, ttl_seconds=3600, key=f"doc-{doc_id}"),
+)
+resp = await router.complete(req, model="anthropic:claude-sonnet-4-6")   # pin: caches are model-scoped
+print(resp.usage.cache_read_input_tokens)   # the only proof that any of it worked
+```
+
+The biggest win costs nothing at runtime. Media used to be attached to the **last** user message on
+every provider, *after* that message's text — the most volatile slot in the prompt. So the document
+sat behind the question, every new question produced a different prefix, and a cache could never
+reach it. `media=True` moves the document to the **first** user message **and ahead of the question**,
+into the prefix every provider keys its cache off. Measured live on a 79k-token PDF: a follow-up
+question went **$0.237 → $0.024**.
+
+| | Anthropic | Gemini | OpenAI | Grok |
+|---|---|---|---|---|
+| Mechanism | explicit `cache_control` breakpoints (≤ 4, budgeted for you) | implicit prefix | implicit prefix | implicit prefix |
+| `system` / `media` / `history` | ✅ (`system` also covers **tools**) | layout only | layout only | layout only |
+| `ttl_seconds` | 5 min, or 1 h at `>= 3600` | — | `24h` retention at `>= 3600` | — |
+| `key` | — | — | `prompt_cache_key` | — (no-op: `xai_sdk` has no per-request headers) |
+
+Two things to know. **Caches are model-scoped and the router picks the model** — a cache written on
+`simple` is cold on `hard`, so pair `media=True` with a pinned model; maslul emits exactly what you
+ask for and won't silently drop it. And **`Usage`'s input fields are disjoint** — `input_tokens` is
+what you paid full price for; the prompt's true size is `input_tokens + cache_read + cache_creation`.
+
 ## Configuration
 
 A TOML file (or a plain `dict` — `Router(config={...})`):

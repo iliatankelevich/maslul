@@ -96,8 +96,11 @@ async def test_gemini_normalizes_text_usage_and_finish_reason() -> None:
     )
     assert out.text == "hi from gemini"
     assert out.provider == "gemini"
-    assert (out.usage.input_tokens, out.usage.output_tokens) == (7, 3)
+    # Gemini's prompt_token_count (7) *includes* the cached token; maslul's Usage fields are
+    # disjoint, so input_tokens is the billable remainder: 7 - 1 = 6. See Usage / split_input.
+    assert (out.usage.input_tokens, out.usage.output_tokens) == (6, 3)
     assert out.usage.cache_read_input_tokens == 1
+    assert out.usage.input_tokens + out.usage.cache_read_input_tokens == 7  # the true prompt size
     assert out.finish_reason == "STOP"
 
 
@@ -530,8 +533,11 @@ async def test_openai_normalizes_text_usage_and_finish_reason() -> None:
     )
     assert out.text == "hi from openai"
     assert out.provider == "openai"
-    assert (out.usage.input_tokens, out.usage.output_tokens) == (4, 2)
+    # OpenAI's prompt_tokens (4) *includes* the cached token; maslul's Usage fields are disjoint,
+    # so input_tokens is the billable remainder: 4 - 1 = 3. See Usage / split_input.
+    assert (out.usage.input_tokens, out.usage.output_tokens) == (3, 2)
     assert out.usage.cache_read_input_tokens == 1
+    assert out.usage.input_tokens + out.usage.cache_read_input_tokens == 4  # the true prompt size
     assert out.finish_reason == "stop"
     assert fake.calls[0]["messages"][0] == {"role": "system", "content": "be terse"}
 

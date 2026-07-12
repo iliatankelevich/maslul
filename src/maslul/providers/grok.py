@@ -9,6 +9,13 @@ Verified live against ``grok-4.3`` — text + usage, and a calculator tool round
 exercises the reconstructed assistant tool-call turn (see
 ``tests/integration/test_providers_live.py``).
 
+**Prompt caching.** Grok caches a matching prefix implicitly, so the stable-first ordering that
+:class:`~maslul.ContextCache` imposes is the entire mechanism here — there is nothing to mark.
+``ContextCache.key`` is a **documented no-op**: ``xai_sdk``'s async ``chat.create()`` exposes no
+per-request headers (so no ``x-grok-conv-id``), and its ``conversation_id`` parameter is *not* a
+cache-affinity knob — it only tags OpenTelemetry spans (``gen_ai.conversation.id``) for tracing.
+Passing it as a cache key would fake the feature, so we don't.
+
 Importing this module requires the ``grok`` extra (``pip install maslul[grok]``).
 """
 
@@ -24,8 +31,17 @@ from xai_sdk.chat import assistant, chat_pb2, image, system, tool, tool_result, 
 from xai_sdk.tools import web_search
 
 from maslul.errors import AuthError, ProviderError, RateLimited, Timeout
-from maslul.providers._common import last_user_index
-from maslul.types import MediaPart, Message, ModelSpec, Request, Response, ToolCall, Usage
+from maslul.providers._common import media_first, media_index, split_input
+from maslul.types import (
+    ContextCache,
+    MediaPart,
+    Message,
+    ModelSpec,
+    Request,
+    Response,
+    ToolCall,
+    Usage,
+)
 
 
 class GrokProvider:
@@ -37,7 +53,9 @@ class GrokProvider:
         self._client: Any = client or (AsyncClient(api_key=api_key) if api_key else AsyncClient())
 
     async def complete(self, spec: ModelSpec, req: Request) -> Response:
-        messages = [system(s) for s in (req.system or [])] + _to_messages(req.messages, req.media)
+        messages = [system(s) for s in (req.system or [])] + _to_messages(
+            req.messages, req.media, req.context_cache
+        )
         kwargs: dict[str, Any] = {"model": spec.model, "messages": messages}
         # Client function tools + the server-side web_search tool (xAI Agent Tools API; the older
         # SearchParameters "Live Search" is deprecated/removed). Both are chat_pb2.Tool entries.
@@ -81,8 +99,15 @@ class GrokProvider:
         await chat.sample()
 
 
-def _to_messages(messages: list[Message], media: list[MediaPart] | None) -> list[Any]:
-    media_at = last_user_index(messages) if media else -1
+def _to_messages(
+    messages: list[Message],
+    media: list[MediaPart] | None,
+    cache: ContextCache | None = None,
+) -> list[Any]:
+    """Media attaches to the last user message, or the **first** when ``ContextCache(media=True)``
+    moves it into the cacheable prefix — which is the whole of Grok's caching story here, since it
+    caches a matching prefix implicitly and reports the saving in ``cached_prompt_text_tokens``."""
+    media_at = media_index(messages, media, cache)
     out: list[Any] = []
     for i, m in enumerate(messages):
         if m.role == "tool":
@@ -103,8 +128,10 @@ def _to_messages(messages: list[Message], media: list[MediaPart] | None) -> list
         elif m.role == "assistant":
             out.append(assistant(m.content))
         elif i == media_at and media:
-            args: list[Any] = [m.content] if m.content else []
-            args += [image(_data_url(p)) for p in media]
+            text: list[Any] = [m.content] if m.content else []
+            parts = [image(_data_url(p)) for p in media]
+            # Media before the text when caching it (see _common.media_first).
+            args = [*parts, *text] if media_first(cache) else [*text, *parts]
             out.append(user(*args))
         else:
             out.append(user(m.content))
@@ -135,12 +162,20 @@ def _tool_calls(resp: Any) -> list[ToolCall]:
 
 
 def _usage(u: Any) -> Usage:
+    """Grok reports cached tokens as ``cached_prompt_text_tokens`` (not the ``prompt_tokens_details
+    .cached_tokens`` its OpenAI-compatible surface suggests), and ``prompt_tokens`` **includes**
+    them; maslul's convention is disjoint, so it is subtracted back out (see
+    :class:`~maslul.Usage`)."""
     if u is None:
         return Usage()
+    billable, cached = split_input(
+        getattr(u, "prompt_tokens", 0) or 0,
+        getattr(u, "cached_prompt_text_tokens", 0) or 0,
+    )
     return Usage(
-        input_tokens=getattr(u, "prompt_tokens", 0) or 0,
+        input_tokens=billable,
         output_tokens=getattr(u, "completion_tokens", 0) or 0,
-        cache_read_input_tokens=getattr(u, "cached_prompt_text_tokens", 0) or 0,
+        cache_read_input_tokens=cached,
     )
 
 

@@ -6,6 +6,74 @@ All notable changes to **maslul** are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-07-12
+
+Portable **prompt caching** — phases 1–3 of [docs/prompt-caching-plan.md](docs/prompt-caching-plan.md).
+Not to be confused with the **response cache** (`[maslul.cache]`), which skips the model call
+entirely; this makes the model call but bills the prefix it has already seen at the cache-read rate.
+
+### Changed
+
+- **⚠️ BREAKING — `Usage.input_tokens` now means "tokens billed at full price" on every provider.**
+  The three input fields are **disjoint**: `input_tokens` (full price) + `cache_read_input_tokens`
+  (~0.1x) + `cache_creation_input_tokens` (write premium, Anthropic only) = the prompt's true size.
+  Anthropic already reported it this way; **OpenAI, Grok and Gemini report a prompt total that
+  *includes* the cached tokens**, and maslul passed that straight through — so
+  `input_tokens + cache_read_input_tokens` **double-counted on three of the four providers**, by
+  exactly the size of the cache hit. Any cost or context-size math built on `Usage` was wrong, and
+  wrong in a way that got *worse* the better caching worked. Those three now subtract the cached
+  count back out ([`providers/_common.py::split_input`](src/maslul/providers/_common.py)).
+  **If you sum `input_tokens` today you were over-counting; after this you are not.** Consumers that
+  add `input_tokens + cache_read_input_tokens` to get a prompt size are now correct on all four.
+
+### Added
+
+- **`ContextCache` + `Request.context_cache`** — a portable prompt-caching contract. The caller
+  declares *what is stable and for how long* (`system`, `media`, `history`, `ttl_seconds`, `key`),
+  never a mechanism, and each provider does the best it can. `context_cache=None` (the default) is
+  today's behaviour byte for byte: no markers, no affinity key, media unmoved.
+- **Stable-first layout — the free win, and the largest one.** Media used to attach to the **last**
+  user message on *every* provider: the most expensive, most stable object in the request parked in
+  the most volatile slot, so a second question about the same document shifted its position and
+  re-billed all of it. With `ContextCache(media=True)` it moves to the **first** user message, into
+  the prefix that Anthropic, Gemini, OpenAI and Grok all key their caches off. No provider-specific
+  code, no runtime cost.
+  **Two halves, and the second one is what makes it work.** `media=True` *also* emits the media
+  blocks **before** the message's own text. A document-QA turn is a single user message holding both
+  the question and the PDF — so moving media "to the first user message" is a no-op there (the first
+  *is* the last), and the rendered blocks were `[text(question), document(pdf)]`. A breakpoint on the
+  document therefore cached a prefix that **began with the volatile question**, so every new question
+  was a fresh prefix and the hit rate was **zero**. Emitting `[document, text]` puts the stable
+  document first, where a prefix cache can reach it. Measured against the live API on the exact
+  Kippy shape: a follow-up question about a 79k-token PDF went **$0.237 → $0.024 (9.9×)**. Anthropic
+  independently recommends document-before-text, so this costs no answer quality.
+- **Anthropic `cache_control` breakpoints** — the only provider that requires explicit markers.
+  `system` marks the last system block (which caches **tools + system** together, since tools render
+  first and a breakpoint caches everything before it); `media` marks the last media block; `history`
+  marks the last content block of the last turn. maslul owns placement within the API's
+  **4-breakpoint budget**, counting any markers the caller hand-placed via `provider_options` and
+  dropping the cheapest of its own rather than letting the request 400. `ttl_seconds >= 3600` opts
+  into the 1-hour cache (2x write premium instead of 1.25x).
+- **OpenAI affinity key** — `ContextCache.key` → `prompt_cache_key`; `ttl_seconds >= 3600` →
+  `prompt_cache_retention="24h"`.
+
+### Notes
+
+- **`ContextCache.key` is a documented no-op on Grok** (and Anthropic and Gemini): `xai_sdk`'s
+  `chat.create()` exposes no per-request headers, and its `conversation_id` is only an OpenTelemetry
+  span attribute — not a cache-affinity knob. Grok still gets the full ordering win. Faking the key
+  would have been worse than not having it.
+- **The cache is model-scoped; the router picks the model.** A cache written on the `simple` tier is
+  cold on `hard`, so an escalating strategy can pay the write premium twice for nothing. Pair
+  `media=True` with a pinned model. maslul emits exactly the markers you ask for and does **not**
+  silently drop them.
+- Below a model's minimum cacheable prefix (2,048–4,096 tokens) Anthropic **silently ignores** a
+  marker rather than erroring. maslul does not try to predict that — it surfaces as
+  `cache_creation_input_tokens == 0`.
+- Gemini *explicit* `CachedContent` (plan phase 4) is deliberately **not** built: Gemini caches
+  implicitly, so measure whether the ordering fix already captured the win before adding
+  server-side state maslul has never had.
+
 ## [0.2.1] - 2026-06-17
 
 ### Fixed

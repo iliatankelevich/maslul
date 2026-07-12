@@ -16,7 +16,7 @@ from google import genai
 from google.genai import types
 
 from maslul.errors import AuthError, ProviderError, RateLimited, Timeout
-from maslul.providers._common import last_user_index
+from maslul.providers._common import media_first, media_index, split_input
 from maslul.types import ModelSpec, Request, Response, ToolCall, Usage
 
 
@@ -103,7 +103,11 @@ class GeminiProvider:
 
 
 def _contents(req: Request) -> list[Any]:
-    media_at = last_user_index(req.messages) if req.media else -1
+    """Media attaches to the last user message, or the **first** when ``ContextCache(media=True)``
+    moves it into the cacheable prefix — all Gemini needs, since it caches a matching prefix
+    implicitly (Gemini 2.5+). Explicit ``CachedContent`` objects are deliberately not used: they
+    add server-side state maslul has never had, and implicit caching may capture the win already."""
+    media_at = media_index(req.messages, req.media, req.context_cache)
     out: list[Any] = []
     for i, m in enumerate(req.messages):
         if m.role == "tool":
@@ -127,11 +131,15 @@ def _contents(req: Request) -> list[Any]:
             ]
             out.append(types.Content(role="model", parts=parts))
         else:
-            parts = [types.Part.from_text(text=m.content)] if m.content else []
+            text = [types.Part.from_text(text=m.content)] if m.content else []
             if i == media_at and req.media:
-                parts += [
+                blobs = [
                     types.Part.from_bytes(data=p.data, mime_type=p.mime_type) for p in req.media
                 ]
+                # Media before the text when caching it (see _common.media_first).
+                parts = [*blobs, *text] if media_first(req.context_cache) else [*text, *blobs]
+            else:
+                parts = text
             out.append(
                 types.Content(role="model" if m.role == "assistant" else "user", parts=parts)
             )
@@ -154,12 +162,18 @@ def _text(resp: Any) -> str:
 
 
 def _usage(um: Any) -> Usage:
+    """``prompt_token_count`` is cached-**inclusive** on Gemini; maslul's convention is disjoint, so
+    the cached count is subtracted back out (see :class:`~maslul.Usage`)."""
     if um is None:
         return Usage()
+    billable, cached = split_input(
+        getattr(um, "prompt_token_count", 0) or 0,
+        getattr(um, "cached_content_token_count", 0) or 0,
+    )
     return Usage(
-        input_tokens=getattr(um, "prompt_token_count", 0) or 0,
+        input_tokens=billable,
         output_tokens=getattr(um, "candidates_token_count", 0) or 0,
-        cache_read_input_tokens=getattr(um, "cached_content_token_count", 0) or 0,
+        cache_read_input_tokens=cached,
     )
 
 

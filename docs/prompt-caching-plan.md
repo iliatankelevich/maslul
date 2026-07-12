@@ -1,6 +1,11 @@
 # Plan — portable prompt caching (context caching)
 
-**Status:** proposed, not implemented. Target: v0.3.0.
+**Status:** phases **1–3 implemented** (unreleased, targeting v0.3.0); phase 4 deliberately not built.
+Two deviations from the text below, both deliberate — the `Request` field is named **`context_cache`**,
+not `cache` (`req.cache` collides with the response cache this document opens by warning about), and
+the history breakpoint goes on the **last** turn, not the last *completed* turn (Anthropic's own
+multi-turn guidance says the most-recently-appended turn, which caches strictly more). §7's open
+questions are now answered — see the notes inline. Remaining: validate in Kippy (§8).
 **Author's note:** written after measuring a real workload (see *Why now*). Every number below was
 measured or read from a provider doc — nothing here is from memory.
 
@@ -275,20 +280,29 @@ may already capture all of it.
 
 ---
 
-## 7. Open questions (verify before implementing — do not guess)
+## 7. Open questions — **ANSWERED** (checked against the installed SDKs, not from memory)
 
-1. **Grok custom headers.** Does `xai_sdk`'s async client expose per-request headers for
-   `x-grok-conv-id`? If not, the Grok affinity key is a no-op and should be documented as such
-   rather than faked.
-2. **Gemini on Vertex.** The caching docs above are the Gemini API's; confirm `client.caches.create`
-   behaves the same through the **Vertex** backend (`vertexai=True`), and whether inline PDF bytes
-   are allowed or a GCS URI is required. maslul is Vertex-only today.
-3. **Gemini implicit minimum vs Kippy's models.** `gemini-3.5-flash` needs 4,096 tokens to cache at
-   all; Kippy's voice-transcription payloads are far below that. Confirm no regression from
-   reordering for small requests (there should be none, but assert it).
-4. **Anthropic minimum per model** is model-dependent (2,048 on Sonnet 4.6, 4,096 on Opus 4.x).
-   maslul should **not** hardcode a table it will have to maintain — emit the marker and let the API
-   ignore it, then surface the truth via `cache_creation_input_tokens == 0`.
+1. **Grok custom headers → NO. The affinity key is a documented no-op.** `xai_sdk`'s async
+   `chat.create()` exposes **no** per-request header parameter, so there is no way to send
+   `x-grok-conv-id` (the client-level `metadata` tuple is set once at construction, and maslul
+   builds the client once by design). Its `conversation_id` parameter is *not* a cache knob — the
+   SDK docstring says it "is added as a span attribute (`gen_ai.conversation.id`)" for
+   **OpenTelemetry** tracing. Passing it as a cache key would fake the feature. Grok still gets the
+   full §3.2 ordering win. Documented in `providers/grok.py`.
+2. **Gemini explicit `CachedContent` → moot.** Phase 4 was not built, so the Vertex question never
+   had to be answered. Implicit caching + §3.2 ordering is what shipped. Re-open only if
+   measurement shows implicit caching is insufficient.
+3. **Small requests → no regression, and now asserted.** Reordering only happens when
+   `context_cache.media` is set, and on a single-turn request the first user message *is* the last
+   one, so the layout is unchanged. `context_cache=None` is byte-for-byte identical to the old
+   behaviour — pinned by `test_*_media_stays_last_without_a_context_cache` on all four providers.
+4. **Anthropic minimum per model → confirmed, and deliberately not modelled.** Below the minimum
+   (2,048 Sonnet / 4,096 Opus) the API **silently ignores** the marker — no error. maslul hardcodes
+   no table; it emits the marker and surfaces the truth as `cache_creation_input_tokens == 0`.
+5. **Bonus, resolved while implementing:** the 1-hour TTL **no longer needs a beta header**
+   (`{"type": "ephemeral", "ttl": "1h"}` on the plain endpoint), and OpenAI's SDK natively accepts
+   `prompt_cache_key` *and* `prompt_cache_retention: "in_memory" | "24h"` — so `ttl_seconds` is
+   honoured on OpenAI too, not just Anthropic.
 
 ---
 
