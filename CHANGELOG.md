@@ -6,6 +6,34 @@ All notable changes to **maslul** are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-07-14
+
+### Fixed
+
+- **Gemini 3 tool calling was broken after the first iteration.** Gemini 3 mints a **thought
+  signature** on the `functionCall` part it emits, and requires it back, unmodified, when the tool
+  loop replays that call alongside its result. `GeminiProvider` rebuilt the part from
+  `ToolCall(name, input)`, so the signature was never captured and never returned — and the
+  **second** request of the loop was rejected outright:
+
+  ```
+  400 INVALID_ARGUMENT: Function call is missing a thought_signature in functionCall parts.
+  ```
+
+  A single-shot call was fine; any turn that actually *used* a tool died. That made
+  `gemini-3.5-flash` unusable as a routable tier for any agent with tools, which is the whole point
+  of the tool loop. Gemini 2.x mints no signature and is unaffected.
+
+  The signature could not be seen from where the code was looking: `_tool_calls` read the
+  `resp.function_calls` convenience accessor, which yields bare `FunctionCall` objects, while the
+  signature lives on the **`Part`** wrapping the call. It now walks the response parts.
+
+### Added
+
+- **`ToolCall.signature: bytes | None`** — opaque provider state a model attached to a specific
+  tool call and requires back on replay. maslul never interprets it. Additive and optional;
+  providers that mint no such state (Anthropic, OpenAI, Grok) leave it `None`.
+
 ## [0.3.0] - 2026-07-12
 
 Portable **prompt caching** — phases 1–3 of [docs/prompt-caching-plan.md](docs/prompt-caching-plan.md).

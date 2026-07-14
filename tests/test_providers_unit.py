@@ -210,16 +210,30 @@ async def test_anthropic_tool_use_translation() -> None:
     }
 
 
-async def test_gemini_tool_use_translation() -> None:
-    resp = SimpleNamespace(
+def _gemini_call_resp(signature: bytes | None) -> SimpleNamespace:
+    """A Gemini response whose function call lives on a PART — which is where the thought signature
+    lives too. The old fake exposed only `resp.function_calls`, so it could not have caught the
+    signature being dropped: the shortcut accessor cannot see it."""
+    part = SimpleNamespace(
+        function_call=SimpleNamespace(name="add", args={"a": 2, "b": 3}),
+        thought_signature=signature,
+    )
+    return SimpleNamespace(
         text=None,
-        function_calls=[SimpleNamespace(name="add", args={"a": 2, "b": 3})],
         usage_metadata=SimpleNamespace(
             prompt_token_count=1, candidates_token_count=1, cached_content_token_count=0
         ),
-        candidates=[SimpleNamespace(finish_reason=SimpleNamespace(name="STOP"))],
+        candidates=[
+            SimpleNamespace(
+                finish_reason=SimpleNamespace(name="STOP"),
+                content=SimpleNamespace(parts=[part]),
+            )
+        ],
     )
-    fake = _FakeGemini(resp)
+
+
+async def test_gemini_tool_use_translation() -> None:
+    fake = _FakeGemini(_gemini_call_resp(None))
     provider = GeminiProvider(client=fake)
     spec = ModelSpec(provider="gemini", model="gemini-2.5-flash")
 
@@ -233,6 +247,50 @@ async def test_gemini_tool_use_translation() -> None:
     contents = fake.calls[1]["contents"]
     assert contents[1].role == "model" and contents[1].parts[0].function_call.name == "add"
     assert contents[2].role == "tool" and contents[2].parts[0].function_response.name == "add"
+
+
+async def test_gemini_thought_signature_survives_the_tool_loop() -> None:
+    """Gemini 3 mints a thought signature on the functionCall part and demands it back on replay.
+    Drop it and the NEXT request 400s — so the loop dies on iteration two, nowhere near the cause.
+    Capture it off the part, carry it on the ToolCall, re-attach it on the way back."""
+    fake = _FakeGemini(_gemini_call_resp(b"sig-abc"))
+    provider = GeminiProvider(client=fake)
+    spec = ModelSpec(provider="gemini", model="gemini-3.5-flash")
+
+    out = await provider.complete(
+        spec, Request(messages=[Message(role="user", content="2+3?")], tools=[_TOOL])
+    )
+    assert out.tool_calls[0].signature == b"sig-abc"  # captured off the PART, not the call
+
+    # Replay it exactly as the router's tool loop does: the model's own call + the tool's result.
+    await provider.complete(
+        spec,
+        Request(
+            messages=[
+                Message(role="user", content="2+3?"),
+                Message(role="assistant", tool_calls=out.tool_calls),
+                Message(role="tool", content="5", tool_call_id=out.tool_calls[0].id, name="add"),
+            ],
+            tools=[_TOOL],
+        ),
+    )
+    replayed = fake.calls[1]["contents"][1].parts[0]
+    assert replayed.function_call.name == "add"
+    assert replayed.thought_signature == b"sig-abc"  # ← without this, Gemini 3 rejects the request
+
+
+async def test_gemini_tool_call_without_a_signature_replays_cleanly() -> None:
+    # Older Gemini mints no signature. None must stay None — not "", not b"" — so the part is sent
+    # exactly as it was before this feature existed.
+    fake = _FakeGemini(_gemini_call_resp(None))
+    provider = GeminiProvider(client=fake)
+    spec = ModelSpec(provider="gemini", model="gemini-2.5-flash")
+    out = await provider.complete(
+        spec, Request(messages=[Message(role="user", content="2+3?")], tools=[_TOOL])
+    )
+    assert out.tool_calls[0].signature is None
+    await provider.complete(spec, Request(messages=_HISTORY, tools=[_TOOL]))
+    assert fake.calls[1]["contents"][1].parts[0].thought_signature is None
 
 
 async def test_grok_tool_use_translation() -> None:

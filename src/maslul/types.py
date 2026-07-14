@@ -156,6 +156,16 @@ class ToolCall:
     id: str
     name: str
     input: dict[str, Any]
+    #: Opaque provider state that the model attached to THIS call and requires back, unmodified,
+    #: when the tool loop replays the call alongside its result. maslul never interprets it.
+    #:
+    #: It exists because a tool call is not always reconstructible from ``(name, input)``. Gemini 3
+    #: attaches a **thought signature** to the ``functionCall`` part; replay it without the
+    #: signature and the *next* request is rejected outright — ``400 INVALID_ARGUMENT: Function
+    #: call is missing a thought_signature in functionCall parts``. So a provider that mints one
+    #: must capture it here, and re-attach it when it rebuilds the turn. Providers with no such
+    #: state (Anthropic, OpenAI, Grok) leave it ``None``.
+    signature: bytes | None = None
 
 
 #: Runs a tool the model asked for and returns its result as text. Supplied by the caller;

@@ -125,8 +125,15 @@ def _contents(req: Request) -> list[Any]:
             parts: list[Any] = []
             if m.content:
                 parts.append(types.Part.from_text(text=m.content))
+            # ⚠️ `thought_signature` is NOT decoration — replaying a Gemini 3 function call without
+            # the signature it minted is a hard 400 on the NEXT request ("Function call is missing
+            # a thought_signature in functionCall parts"), i.e. the tool loop dies on its second
+            # iteration. Older models mint none; the field is then None and Gemini ignores it.
             parts += [
-                types.Part(function_call=types.FunctionCall(name=tc.name, args=tc.input))
+                types.Part(
+                    function_call=types.FunctionCall(name=tc.name, args=tc.input),
+                    thought_signature=tc.signature,
+                )
                 for tc in m.tool_calls
             ]
             out.append(types.Content(role="model", parts=parts))
@@ -146,12 +153,37 @@ def _contents(req: Request) -> list[Any]:
     return out
 
 
+def _response_parts(resp: Any) -> list[Any]:
+    candidates = getattr(resp, "candidates", None) or []
+    if not candidates:
+        return []
+    content = getattr(candidates[0], "content", None)
+    return list(getattr(content, "parts", None) or [])
+
+
 def _tool_calls(resp: Any) -> list[ToolCall]:
-    # Gemini function calls carry no id — match results back by name.
-    return [
-        ToolCall(id=getattr(fc, "id", None) or fc.name, name=fc.name, input=dict(fc.args or {}))
-        for fc in (getattr(resp, "function_calls", None) or [])
-    ]
+    """Gemini function calls carry no id — results match back by name.
+
+    ⚠️ Read the **parts**, not the ``resp.function_calls`` convenience accessor. That accessor
+    yields bare ``FunctionCall`` objects, and Gemini 3's thought signature is not on the call — it
+    is on the ``Part`` that wraps it. Take the shortcut and the signature is silently unreachable,
+    so the loop only fails one request later, at replay, with an error naming a field this function
+    never saw. ``_contents`` puts it back.
+    """
+    calls: list[ToolCall] = []
+    for part in _response_parts(resp):
+        fc = getattr(part, "function_call", None)
+        if fc is None:
+            continue
+        calls.append(
+            ToolCall(
+                id=getattr(fc, "id", None) or fc.name,
+                name=fc.name,
+                input=dict(fc.args or {}),
+                signature=getattr(part, "thought_signature", None),
+            )
+        )
+    return calls
 
 
 def _text(resp: Any) -> str:
