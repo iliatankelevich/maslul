@@ -144,6 +144,59 @@ async def test_grok_tool_loop_live() -> None:
     await _calculator_round_trip("grok", GrokProvider(), model)
 
 
+_MUL_TOOL = ToolDef(
+    name="mul",
+    description="Multiply two integers a and b.",
+    input_schema={
+        "type": "object",
+        "properties": {"a": {"type": "integer"}, "b": {"type": "integer"}},
+        "required": ["a", "b"],
+    },
+)
+
+
+@requires_gemini
+async def test_gemini_parallel_tool_loop_live() -> None:
+    """The regression this exists for: Gemini answers a two-call turn with ONE content holding two
+    ``functionResponse`` parts. One content per result is a hard 400 ("the number of function
+    response parts is equal to the number of function call parts"), and only a model that actually
+    decides to call two tools at once reaches it — no unit test can prove the wire format is right.
+    """
+    from maslul.providers.gemini import GeminiProvider
+
+    project = os.getenv("MASLUL_VERTEX_PROJECT") or os.getenv("GOOGLE_CLOUD_PROJECT")
+    provider = GeminiProvider(
+        vertex_project=project, vertex_location=os.getenv("MASLUL_VERTEX_LOCATION", "global")
+    )
+    model = os.getenv("MASLUL_GEMINI_MODEL", "gemini-3.5-flash")
+    router = _router("gemini", provider, model)
+
+    calls: list[str] = []
+
+    async def run(call: Any) -> str:  # noqa: ANN401 - ToolCall, kept loose for the test
+        calls.append(call.name)
+        a, b = call.input["a"], call.input["b"]
+        return str(a + b if call.name == "add" else a * b)
+
+    resp = await router.complete(
+        Request(
+            messages=[
+                Message(
+                    role="user",
+                    content="Compute 21 + 21 with the add tool and 21 * 2 with the mul tool. "
+                    "Call both tools in the same turn, then state both results.",
+                )
+            ],
+            tools=[_ADD_TOOL, _MUL_TOOL],
+            tool_executor=run,
+            max_tokens=512,
+        ),
+        level=Level.HARD,
+    )
+    assert sorted(calls) == ["add", "mul"]
+    assert "42" in resp.text
+
+
 # --- M3: structured output + vision ------------------------------------------------------
 
 _CITY_SCHEMA = {

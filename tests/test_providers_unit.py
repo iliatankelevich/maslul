@@ -293,6 +293,35 @@ async def test_gemini_tool_call_without_a_signature_replays_cleanly() -> None:
     assert fake.calls[1]["contents"][1].parts[0].thought_signature is None
 
 
+async def test_gemini_parallel_tool_results_collapse_into_one_turn() -> None:
+    """Gemini counts PARTS per turn, not ids: a model turn with N functionCall parts must be
+    answered by ONE turn with N functionResponse parts. One content per result 400s the moment a
+    model calls two tools at once ("the number of function response parts is equal to the number of
+    function call parts of the function call turn") — which is a normal thing for a model to do."""
+    fake = _FakeGemini(_gemini_call_resp(None))
+    provider = GeminiProvider(client=fake)
+    calls = [
+        ToolCall(id="c1", name="add", input={"a": 2, "b": 3}),
+        ToolCall(id="c2", name="mul", input={"a": 2, "b": 3}),
+    ]
+    await provider.complete(
+        ModelSpec(provider="gemini", model="gemini-3.5-flash"),
+        Request(
+            messages=[
+                Message(role="user", content="2+3 and 2*3?"),
+                Message(role="assistant", tool_calls=calls),
+                Message(role="tool", content="5", tool_call_id="c1", name="add"),
+                Message(role="tool", content="6", tool_call_id="c2", name="mul"),
+            ],
+            tools=[_TOOL],
+        ),
+    )
+    contents = fake.calls[0]["contents"]
+    assert [c.role for c in contents] == ["user", "model", "tool"]
+    assert len(contents[1].parts) == len(contents[2].parts) == 2
+    assert [p.function_response.name for p in contents[2].parts] == ["add", "mul"]
+
+
 async def test_grok_tool_use_translation() -> None:
     resp = SimpleNamespace(
         content="",

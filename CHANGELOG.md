@@ -6,6 +6,31 @@ All notable changes to **maslul** are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.3.2] - 2026-08-03
+
+### Fixed
+
+- **Gemini rejected every turn in which the model called two tools at once.** Gemini matches tool
+  results **by position within a turn**, not by id: a `model` turn holding N `functionCall` parts
+  must be answered by exactly **one** turn holding N `functionResponse` parts. `_contents` emitted
+  one `Content` per tool result, so a two-call turn produced two single-part contents and the
+  request was rejected outright:
+
+  ```
+  400 INVALID_ARGUMENT: Please ensure that the number of function response parts is equal to
+  the number of function call parts of the function call turn.
+  ```
+
+  Consecutive `tool` messages now collapse into a single `tool` content — the same grouping the
+  Anthropic provider has always done for `tool_result` blocks. Grok and OpenAI are unaffected: both
+  key results by `tool_call_id` and take one message each, which is their correct wire format.
+
+  Sequential tool use was never affected (1 call ↔ 1 result), which is why this survived 0.3.1 —
+  only a model *choosing* to parallelize hit it, and then the whole turn was lost. Caught in
+  production on `gemini-3.5-flash`, where a document-filing agent naturally called two tools in one
+  turn. `tests/integration/test_providers_live.py::test_gemini_parallel_tool_loop_live` reproduces
+  the 400 against Vertex without the fix and passes with it.
+
 ## [0.3.1] - 2026-07-14
 
 ### Fixed

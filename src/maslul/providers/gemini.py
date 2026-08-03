@@ -106,22 +106,32 @@ def _contents(req: Request) -> list[Any]:
     """Media attaches to the last user message, or the **first** when ``ContextCache(media=True)``
     moves it into the cacheable prefix — all Gemini needs, since it caches a matching prefix
     implicitly (Gemini 2.5+). Explicit ``CachedContent`` objects are deliberately not used: they
-    add server-side state maslul has never had, and implicit caching may capture the win already."""
+    add server-side state maslul has never had, and implicit caching may capture the win already.
+
+    ⚠️ Consecutive ``tool`` results collapse into a **single** ``tool`` content, the way Anthropic's
+    ``tool_result`` blocks do. Gemini counts parts per turn, not ids: a model turn holding N
+    ``functionCall`` parts must be answered by ONE turn holding N ``functionResponse`` parts, or the
+    request is rejected outright ("Please ensure that the number of function response parts is equal
+    to the number of function call parts of the function call turn"). One content per result made
+    every **parallel** tool call — two tools in one turn — a hard 400.
+    """
     media_at = media_index(req.messages, req.media, req.context_cache)
     out: list[Any] = []
+    pending: list[Any] = []
+
+    def flush() -> None:
+        if pending:
+            out.append(types.Content(role="tool", parts=list(pending)))
+            pending.clear()
+
     for i, m in enumerate(req.messages):
         if m.role == "tool":
-            out.append(
-                types.Content(
-                    role="tool",
-                    parts=[
-                        types.Part.from_function_response(
-                            name=m.name or "", response={"result": m.content}
-                        )
-                    ],
-                )
+            pending.append(
+                types.Part.from_function_response(name=m.name or "", response={"result": m.content})
             )
-        elif m.role == "assistant" and m.tool_calls:
+            continue
+        flush()
+        if m.role == "assistant" and m.tool_calls:
             parts: list[Any] = []
             if m.content:
                 parts.append(types.Part.from_text(text=m.content))
@@ -150,6 +160,7 @@ def _contents(req: Request) -> list[Any]:
             out.append(
                 types.Content(role="model" if m.role == "assistant" else "user", parts=parts)
             )
+    flush()
     return out
 
 
