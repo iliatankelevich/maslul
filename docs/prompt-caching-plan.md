@@ -74,7 +74,7 @@ mark what to cache.** The other three cache a matching *prefix* automatically.
 | **Mechanism** | Explicit `cache_control` breakpoints on content blocks | **Implicit** (auto) + **explicit** `CachedContent` objects | Implicit (auto) | Implicit (auto) |
 | **Caller must act?** | **Yes** — no marker, no cache | No (implicit); yes for explicit | No | No |
 | **Granularity** | Up to **4** breakpoints; caches the prefix up to each | Implicit: prefix. Explicit: a named server-side object | Prefix only | Prefix only |
-| **Minimum to cache** | 2,048 tok (Sonnet 4.6) / 4,096 (Opus 4.x) / 1,024 (Sonnet 4.5) — *model-dependent* | 2,048 (Gemini 2.5) / 4,096 (3.5 Flash, 3.1 Pro) | 1,024 tok | not documented |
+| **Minimum to cache** | 2,048 tok (Sonnet 4.6) / 4,096 (Opus 4.x) / 1,024 (Sonnet 4.5) — *model-dependent* | **explicit** 4,096 (3.x, enforced with a 400); **implicit** documented as the same but measured much higher — ~10,000 on 3.8-flash | 1,024 tok | not documented |
 | **TTL** | 5 min (default) or 1 h | Implicit: opaque. Explicit: caller-set `ttl` | 30 min (fixed on current models) | opaque |
 | **Write premium** | 1.25× (5 m) / 2× (1 h) | none (implicit) | 1.25× | none documented |
 | **Read discount** | **0.1×** | passed through automatically | ~0.1× | "substantially lower" |
@@ -259,10 +259,13 @@ Each phase is independently shippable and independently valuable.
 | **1. Accounting** | Make `input_tokens` / `cache_read` / `cache_creation` disjoint on all four providers (§3.4) | low (public-field semantics change → CHANGELOG) | Cost math stops being wrong. Must land **before** the rest, or we cannot measure whether the rest worked |
 | **2. Layout** | `ContextCache` type + stable-first ordering + `key` → OpenAI/Grok affinity | low | The full win on Gemini/OpenAI/Grok, with **zero** provider-specific caching code |
 | **3. Anthropic** | `cache_control` breakpoints (system, media, history) + the 4-breakpoint budget | medium | The measured 10× on Kippy's document path — the reason this plan exists |
-| **4. Gemini explicit** | `client.caches.create()` + cache-handle lifecycle | high (introduces state maslul has never had) | Only if phase 2's implicit caching proves insufficient — **measure first** |
+| **4. Gemini explicit** | `client.caches.create()` + cache-handle lifecycle | high (introduces state maslul has never had) | ~~Only if phase 2's implicit caching proves insufficient — **measure first**~~ **Measured 2026-09-04: it is insufficient in the 4,096–10,000 token band. See §7.2.** |
 
-Phase 4 may never be needed. Do not build it speculatively: Gemini caches implicitly, and phase 2
-may already capture all of it.
+~~Phase 4 may never be needed. Do not build it speculatively: Gemini caches implicitly, and phase 2
+may already capture all of it.~~
+
+**Phase 4 is now justified by measurement, not speculation** — the gate this table set has been
+met. See outcome 2 in §7 for the numbers and the dead band they describe.
 
 ---
 
@@ -289,9 +292,33 @@ may already capture all of it.
    SDK docstring says it "is added as a span attribute (`gen_ai.conversation.id`)" for
    **OpenTelemetry** tracing. Passing it as a cache key would fake the feature. Grok still gets the
    full §3.2 ordering win. Documented in `providers/grok.py`.
-2. **Gemini explicit `CachedContent` → moot.** Phase 4 was not built, so the Vertex question never
-   had to be answered. Implicit caching + §3.2 ordering is what shipped. Re-open only if
-   measurement shows implicit caching is insufficient.
+2. **Gemini explicit `CachedContent` → RE-OPENED 2026-09-04. The measurement came back, and
+   implicit caching is insufficient for a tool-using agent.** Phase 4 shipped as not-built on the
+   reasoning that implicit caching "may already capture all of it". Measured against
+   `gemini-3.8-flash` on Vertex (kippy-499107/global), it captures none of it at realistic size:
+
+   | stable prefix | implicit `cache_read` | explicit `CachedContent` |
+   |---|---|---|
+   | 2,283 tok | 0 | refused — `400: minimum token count to start explicit caching is 4,096` |
+   | 4,203 tok | 0 | **4,203 cached** |
+   | 4,563 tok | 0 | **4,563 cached** |
+   | 5,043 tok | 0 | **5,043 cached** |
+   | ~10,800 tok | 8,163 | (not tested — implicit already works) |
+   | ~65,000 tok | 61,404 | (not tested) |
+
+   **There is a dead band between the explicit floor (4,096) and roughly 10,000 tokens where
+   implicit caching returns nothing and explicit caching returns everything.** That band is exactly
+   where an agent with a system prompt plus tool declarations lives: the consumer that motivated
+   this plan sits at ~4,420 tokens (persona + guidance + 17 tool schemas) and gets `cache_read=0` on
+   three identical back-to-back calls, while an explicit cache at the same size returns ~99% of the
+   prompt as a cache read.
+
+   Two things also ruled out while measuring, both worth not re-testing:
+   - **Tool declarations do not break implicit caching.** With the same ~13,500-token prefix, both
+     with and without 17 tools cached (11,674 and 8,169 read respectively). There is an open
+     `vercel/ai` issue claiming otherwise; it does not reproduce here.
+   - **The §3.2 ordering is correct and is not the problem.** The consumer already sends
+     stable-first / volatile-last, and the miss is purely the size floor.
 3. **Small requests → no regression, and now asserted.** Reordering only happens when
    `context_cache.media` is set, and on a single-turn request the first user message *is* the last
    one, so the layout is unchanged. `context_cache=None` is byte-for-byte identical to the old
