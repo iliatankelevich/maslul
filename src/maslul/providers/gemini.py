@@ -10,6 +10,11 @@ Importing this module requires the ``gemini`` extra (``pip install maslul[gemini
 
 from __future__ import annotations
 
+import hashlib
+import json
+import logging
+import time
+from collections import OrderedDict
 from typing import Any
 
 from google import genai
@@ -17,7 +22,13 @@ from google.genai import types
 
 from maslul.errors import AuthError, ProviderError, RateLimited, Timeout
 from maslul.providers._common import media_first, media_index, split_input
-from maslul.types import ModelSpec, Request, Response, ToolCall, Usage
+from maslul.types import ContextCache, ModelSpec, Request, Response, ToolCall, Usage
+
+log = logging.getLogger(__name__)
+
+# How many cache handles one provider instance keeps. Each entry is a short string, so the bound is
+# about server-side hygiene (we delete on eviction), not memory.
+_MAX_HANDLES = 32
 
 
 class GeminiProvider:
@@ -43,6 +54,8 @@ class GeminiProvider:
             self._client = genai.Client(api_key=api_key)
         else:
             self._client = genai.Client()  # resolve from ADC / environment
+        # key -> (cache resource name, local expiry). Bounded; see _MAX_HANDLES.
+        self._handles: OrderedDict[str, tuple[str, float]] = OrderedDict()
 
     async def complete(self, spec: ModelSpec, req: Request) -> Response:
         config: dict[str, Any] = {}
@@ -78,6 +91,15 @@ class GeminiProvider:
             tools.append(types.Tool(google_search=types.GoogleSearch()))
         if tools:
             config["tools"] = tools
+        # Phase 4: explicit CachedContent. Opt-in — only when the caller declared a TTL, because
+        # this is the one path that creates server-side state. Everything stable (system + ALL
+        # tools) moves into the cache: Vertex rejects a request that sets `cached_content` together
+        # with `tools` or `system_instruction` ("Tool config, tools and system instruction should
+        # not be set"), so it is all-or-nothing, not a split.
+        cached_name = await self._explicit_cache(spec, req, config)
+        if cached_name is not None:
+            config = {k: v for k, v in config.items() if k not in ("system_instruction", "tools")}
+            config["cached_content"] = cached_name
         try:
             resp = await self._client.aio.models.generate_content(
                 model=spec.model,
@@ -85,7 +107,27 @@ class GeminiProvider:
                 config=types.GenerateContentConfig(**config) if config else None,
             )
         except Exception as e:  # noqa: BLE001 - normalized below
-            raise _map_error(e) from e
+            # A cache can expire server-side between our TTL bookkeeping and this call. That is a
+            # race we caused, so pay for it once: forget the handle and retry uncached rather than
+            # surfacing an error the caller cannot act on.
+            if cached_name is not None and _is_missing_cache(e):
+                self._forget(cached_name)
+                log.debug("gemini cache %s vanished; retrying uncached", cached_name)
+                retry = {k: v for k, v in config.items() if k != "cached_content"}
+                if req.system:
+                    retry["system_instruction"] = "\n\n".join(req.system)
+                if tools:
+                    retry["tools"] = tools
+                try:
+                    resp = await self._client.aio.models.generate_content(
+                        model=spec.model,
+                        contents=_contents(req),
+                        config=types.GenerateContentConfig(**retry) if retry else None,
+                    )
+                except Exception as e2:  # noqa: BLE001 - normalized below
+                    raise _map_error(e2) from e2
+            else:
+                raise _map_error(e) from e
         return Response(
             text=_text(resp),
             level_used=None,
@@ -97,6 +139,76 @@ class GeminiProvider:
             sources=_sources(resp),
             raw=resp,
         )
+
+    async def _explicit_cache(
+        self, spec: ModelSpec, req: Request, config: dict[str, Any]
+    ) -> str | None:
+        """The resource name of a ``CachedContent`` holding this request's stable prefix, or None.
+
+        None means "send the request the ordinary way" and is the answer for every failure mode:
+        not opted in, nothing stable to cache, the prefix is under the model's minimum, quota,
+        a transient API error. **A caching problem must never become the caller's problem** — the
+        request still succeeds, it just costs full price, which is exactly how the Anthropic
+        provider treats a below-minimum breakpoint.
+        """
+        cc: ContextCache | None = req.context_cache
+        # ttl_seconds is the opt-in. `system=True` alone is a layout hint that costs nothing;
+        # creating a server-side object is a different kind of promise, so it needs asking for.
+        if cc is None or not cc.ttl_seconds or not cc.system:
+            return None
+        if "system_instruction" not in config and "tools" not in config:
+            return None  # nothing stable to put in it
+
+        key = cc.key or _cache_key(spec.model, config)
+        now = time.monotonic()
+        hit = self._handles.get(key)
+        if hit is not None:
+            name, expires = hit
+            # Re-check with a margin: a handle that expires mid-flight costs a failed call and a
+            # retry, and the margin is far cheaper than the round trip.
+            if expires - now > 5.0:
+                self._handles.move_to_end(key)
+                return name
+            self._handles.pop(key, None)
+
+        create: dict[str, Any] = {"ttl": f"{int(cc.ttl_seconds)}s"}
+        if "system_instruction" in config:
+            create["system_instruction"] = config["system_instruction"]
+        if "tools" in config:
+            create["tools"] = config["tools"]
+        try:
+            created = await self._client.aio.caches.create(
+                model=spec.model, config=types.CreateCachedContentConfig(**create)
+            )
+        except Exception as exc:  # noqa: BLE001 - caching is best-effort by design
+            # The commonest case by far is a prefix under the model's minimum (4,096 tokens on the
+            # 3.x line), which the API refuses with a 400 naming the number. Debug, not warning:
+            # it is a normal outcome for a small prompt, not a fault.
+            log.debug("gemini explicit cache unavailable (%s); sending uncached", exc)
+            return None
+
+        name = getattr(created, "name", None)
+        if not name:
+            return None
+        self._handles[key] = (name, now + float(cc.ttl_seconds))
+        self._handles.move_to_end(key)
+        while len(self._handles) > _MAX_HANDLES:
+            _, (evicted, _) = self._handles.popitem(last=False)
+            await self._delete(evicted)
+        return name
+
+    def _forget(self, name: str) -> None:
+        for key, (handle, _) in list(self._handles.items()):
+            if handle == name:
+                self._handles.pop(key, None)
+
+    async def _delete(self, name: str) -> None:
+        """Best-effort server-side delete. A leaked cache expires on its own TTL, so a failure here
+        is a tidiness problem, never a correctness one."""
+        try:
+            await self._client.aio.caches.delete(name=name)
+        except Exception as exc:  # noqa: BLE001 - tidiness only
+            log.debug("gemini cache %s could not be deleted (%s); it will expire", name, exc)
 
     async def healthcheck(self, spec: ModelSpec) -> None:
         await self._client.aio.models.generate_content(model=spec.model, contents="ping")
@@ -255,3 +367,43 @@ def _map_error(e: Exception) -> Exception:
     if code in (401, 403):
         return AuthError(str(e))
     return ProviderError(str(e))
+
+
+def _cache_key(model: str, config: dict[str, Any]) -> str:
+    """Identity of a cacheable prefix: the model plus everything that goes inside the cache.
+
+    The model belongs in the key because a ``CachedContent`` is model-scoped — reusing one across
+    an escalation would 400. The tools belong in it because ``web_search`` changes the cached tool
+    set, and two chats that differ only by whether search is on must not share a handle.
+    """
+    h = hashlib.sha256()
+    h.update(model.encode())
+    h.update(b"\x00")
+    h.update(str(config.get("system_instruction", "")).encode())
+    for tool in config.get("tools") or []:
+        h.update(b"\x00")
+        h.update(_tool_fingerprint(tool).encode())
+    return h.hexdigest()
+
+
+def _tool_fingerprint(tool: Any) -> str:
+    """A stable string for one Gemini ``Tool``.
+
+    Uses the SDK's own serialization when available and falls back to ``repr`` — a fingerprint only
+    has to be stable and collision-free, not readable.
+    """
+    for attr in ("model_dump_json", "to_json_dict"):
+        dump = getattr(tool, attr, None)
+        if callable(dump):
+            try:
+                out = dump()
+                return out if isinstance(out, str) else json.dumps(out, sort_keys=True, default=str)
+            except Exception:  # noqa: BLE001 - fall through to repr
+                pass
+    return repr(tool)
+
+
+def _is_missing_cache(exc: Exception) -> bool:
+    """Whether an error says the cache we referenced is gone (expired or deleted elsewhere)."""
+    text = str(exc).lower()
+    return "cachedcontent" in text.replace(" ", "") or ("not found" in text and "cache" in text)

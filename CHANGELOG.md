@@ -6,6 +6,53 @@ All notable changes to **maslul** are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-09-04
+
+### Added
+
+- **Gemini explicit context caching (`CachedContent`) — prompt-caching plan, phase 4.** Opt in by
+  setting both `ContextCache(system=True, ttl_seconds=...)`; without a TTL nothing changes, because
+  this is the one path that creates server-side state and that should be asked for, not inferred.
+
+  Phase 4 was deliberately left unbuilt in 0.3.0 on the reasoning that Gemini "caches implicitly, and
+  phase 2 may already capture all of it", gated on measuring it first. **Measured against
+  `gemini-3.8-flash` on Vertex, it captures none of it at the size an agent actually runs at:**
+
+  | stable prefix | implicit `cache_read` | explicit `CachedContent` |
+  |---|---|---|
+  | 2,283 tok | 0 | refused — `400: minimum token count to start explicit caching is 4,096` |
+  | 4,203 tok | 0 | **4,203 cached** |
+  | 4,563 tok | 0 | **4,563 cached** |
+  | 5,043 tok | 0 | **5,043 cached** |
+  | ~10,800 tok | 8,163 | (implicit already works) |
+
+  There is a **dead band between the 4,096-token explicit floor and roughly 10,000 tokens** where
+  implicit caching returns nothing and explicit returns essentially everything — and that band is
+  exactly where a system prompt plus tool declarations lands.
+
+  Behaviour worth knowing:
+  - **The whole stable half moves into the cache, system instruction *and* tools.** Vertex rejects a
+    request that sets `cached_content` together with `tools` or `system_instruction`
+    (`"Tool config, tools and system instruction should not be set"`), so it is all-or-nothing.
+    `google_search` caches fine and still grounds — verified, not assumed.
+  - **`web_search` is part of the cache key.** The search tool lives inside the cache, so two
+    otherwise-identical requests that differ only in `web_search` must not share a handle.
+  - **A caching failure is never the caller's failure.** Under the model's minimum, out of quota, or
+    any other error, the request is sent the ordinary way at full price — the same contract as an
+    Anthropic breakpoint below the minimum being silently ignored.
+  - **A cache that expires mid-flight is retried uncached, once.** TTL expiry is a race the library
+    introduced, so the library pays for it rather than surfacing an error nobody can act on.
+  - Handles are kept in a bounded per-provider LRU (32) and deleted server-side on eviction; a leaked
+    cache expires on its own TTL.
+
+### Changed
+
+- `docs/prompt-caching-plan.md` records the measurement that re-opened phase 4, and corrects the
+  provider table: the documented 4,096-token Gemini minimum holds for **explicit** caching, where the
+  API enforces it with a 400. For **implicit** caching it is optimistic — nothing cached below
+  ~10,000 tokens in these runs. Also documented: tool declarations do **not** break implicit caching
+  (an open `vercel/ai` issue claims they do; it does not reproduce on Vertex).
+
 ## [0.3.2] - 2026-08-03
 
 ### Fixed

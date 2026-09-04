@@ -18,7 +18,15 @@ from maslul.providers.anthropic import AnthropicProvider
 from maslul.providers.gemini import GeminiProvider
 from maslul.providers.grok import GrokProvider
 from maslul.providers.openai import OpenAIProvider
-from maslul.types import MediaPart, Message, ModelSpec, Request, ToolCall, ToolDef
+from maslul.types import (
+    ContextCache,
+    MediaPart,
+    Message,
+    ModelSpec,
+    Request,
+    ToolCall,
+    ToolDef,
+)
 
 
 def _req() -> Request:
@@ -670,3 +678,152 @@ async def test_openai_web_search_sets_options_and_maps_citations() -> None:
     )
     assert fake.calls[0]["web_search_options"] == {}
     assert out.sources == ["https://ex.com/c"]
+
+
+# --- Gemini explicit context cache (prompt-caching plan, phase 4) --------------------------
+
+
+class _FakeCaches:
+    """Records ``create``/``delete`` and can be told to fail creation, the way Vertex does when the
+    prefix is under the model's 4,096-token minimum."""
+
+    def __init__(self, fail: Exception | None = None) -> None:
+        self.created: list[dict[str, Any]] = []
+        self.deleted: list[str] = []
+        self._fail = fail
+        self._n = 0
+
+    async def create(self, **kwargs: Any) -> Any:
+        if self._fail is not None:
+            raise self._fail
+        self.created.append(kwargs)
+        self._n += 1
+        return SimpleNamespace(name=f"cachedContents/{self._n}")
+
+    async def delete(self, *, name: str) -> None:
+        self.deleted.append(name)
+
+
+class _FakeGeminiWithCaches(_FakeGemini):
+    def __init__(
+        self, resp: Any, *, fail: Exception | None = None, gen_fail_once: Exception | None = None
+    ) -> None:
+        super().__init__(resp)
+        self.caches = _FakeCaches(fail)
+        self._gen_fail_once = gen_fail_once
+        self.aio = SimpleNamespace(
+            models=SimpleNamespace(generate_content=self._gen), caches=self.caches
+        )
+
+    async def _gen(self, **kwargs: Any) -> Any:
+        if self._gen_fail_once is not None:
+            err, self._gen_fail_once = self._gen_fail_once, None
+            self.calls.append(kwargs)
+            raise err
+        return await super()._gen(**kwargs)
+
+
+def _cache_resp() -> SimpleNamespace:
+    return SimpleNamespace(
+        text="ok",
+        usage_metadata=SimpleNamespace(
+            prompt_token_count=10, candidates_token_count=2, cached_content_token_count=8
+        ),
+        candidates=[SimpleNamespace(finish_reason=SimpleNamespace(name="STOP"))],
+    )
+
+
+def _cached_req(**over: Any) -> Request:
+    base: dict[str, Any] = {
+        "messages": [Message(role="user", content="hello")],
+        "system": ["a stable persona"],
+        "context_cache": ContextCache(system=True, ttl_seconds=300),
+    }
+    base.update(over)
+    return Request(**base)
+
+
+_SPEC = ModelSpec(provider="gemini", model="gemini-3.8-flash")
+
+
+async def test_gemini_context_cache_is_opt_in_via_ttl() -> None:
+    """`system=True` alone is a free layout hint; creating server-side state needs a TTL."""
+    fake = _FakeGeminiWithCaches(_cache_resp())
+    await GeminiProvider(client=fake).complete(
+        _SPEC, _cached_req(context_cache=ContextCache(system=True))
+    )
+    assert fake.caches.created == []
+    sent = fake.calls[0]["config"]
+    assert sent.cached_content is None
+    assert sent.system_instruction == "a stable persona"  # still sent inline, uncached
+
+
+async def test_gemini_no_context_cache_is_byte_for_byte_unchanged() -> None:
+    fake = _FakeGeminiWithCaches(_cache_resp())
+    await GeminiProvider(client=fake).complete(_SPEC, _req())
+    assert fake.caches.created == []
+    assert fake.calls[0]["config"].cached_content is None
+    assert fake.calls[0]["config"].system_instruction == "be terse"
+
+
+async def test_gemini_explicit_cache_moves_system_and_tools_into_the_cache() -> None:
+    """Vertex rejects `cached_content` sent alongside `tools`/`system_instruction`, so the stable
+    half must move wholesale — asserted here because a split would 400 only in production."""
+    fake = _FakeGeminiWithCaches(_cache_resp())
+    req = _cached_req(
+        tools=[ToolDef(name="t", description="d", input_schema={"type": "object"})],
+        web_search=True,
+    )
+    await GeminiProvider(client=fake).complete(_SPEC, req)
+
+    assert len(fake.caches.created) == 1
+    created = fake.caches.created[0]["config"]
+    assert created.system_instruction == "a stable persona"
+    assert created.tools is not None and len(created.tools) == 2  # function decls + google_search
+    sent = fake.calls[0]["config"]
+    assert sent.cached_content == "cachedContents/1"
+    assert sent.system_instruction is None
+    assert sent.tools is None
+
+
+async def test_gemini_reuses_one_cache_across_identical_calls() -> None:
+    fake = _FakeGeminiWithCaches(_cache_resp())
+    provider = GeminiProvider(client=fake)
+    for _ in range(3):
+        await provider.complete(_SPEC, _cached_req())
+    assert len(fake.caches.created) == 1
+    assert [c["config"].cached_content for c in fake.calls] == ["cachedContents/1"] * 3
+
+
+async def test_gemini_web_search_flag_does_not_share_a_cache() -> None:
+    """The search tool lives *inside* the cache, so two chats differing only by whether search is
+    on must not share a handle — otherwise one of them silently gets the other's tool set."""
+    fake = _FakeGeminiWithCaches(_cache_resp())
+    provider = GeminiProvider(client=fake)
+    await provider.complete(_SPEC, _cached_req(web_search=False))
+    await provider.complete(_SPEC, _cached_req(web_search=True))
+    assert len(fake.caches.created) == 2
+
+
+async def test_gemini_falls_back_to_an_uncached_call_when_the_cache_cannot_be_made() -> None:
+    """Under the model's minimum Vertex 400s. That must cost full price, never the request."""
+    fake = _FakeGeminiWithCaches(
+        _cache_resp(), fail=RuntimeError("400 minimum token count is 4096")
+    )
+    out = await GeminiProvider(client=fake).complete(_SPEC, _cached_req())
+    assert out.text == "ok"
+    sent = fake.calls[0]["config"]
+    assert sent.cached_content is None
+    assert sent.system_instruction == "a stable persona"
+
+
+async def test_gemini_retries_uncached_when_the_cache_expired_server_side() -> None:
+    """TTL expiry is a race we introduced; the caller should never see it."""
+    gone = RuntimeError("404 CachedContent not found")
+    fake = _FakeGeminiWithCaches(_cache_resp(), gen_fail_once=gone)
+    out = await GeminiProvider(client=fake).complete(_SPEC, _cached_req())
+    assert out.text == "ok"
+    assert len(fake.calls) == 2
+    assert fake.calls[0]["config"].cached_content == "cachedContents/1"
+    assert fake.calls[1]["config"].cached_content is None
+    assert fake.calls[1]["config"].system_instruction == "a stable persona"

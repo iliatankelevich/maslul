@@ -265,7 +265,19 @@ Each phase is independently shippable and independently valuable.
 may already capture all of it.~~
 
 **Phase 4 is now justified by measurement, not speculation** — the gate this table set has been
-met. See outcome 2 in §7 for the numbers and the dead band they describe.
+met, and phase 4 **shipped in 0.4.0**. See outcome 2 in §7 for the numbers and the dead band they
+describe.
+
+Two API constraints found while building it, both of which shaped the design and neither of which
+is in the docs:
+
+1. **A request using `cached_content` may not also set `tools` or `system_instruction`** — Vertex
+   answers `400: "Tool config, tools and system instruction should not be set"`. The stable half
+   therefore moves into the cache *wholesale*; there is no splitting system-into-cache and
+   tools-into-request.
+2. **`google_search` can live inside a `CachedContent` and still grounds.** Checked A/B against the
+   uncached path (3 sources either way) — worth recording, because "the new cache silently stopped
+   the model searching" is exactly the kind of regression that would not surface in a unit test.
 
 ---
 
