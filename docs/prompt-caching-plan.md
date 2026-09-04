@@ -5,7 +5,7 @@ Two deviations from the text below, both deliberate — the `Request` field is n
 not `cache` (`req.cache` collides with the response cache this document opens by warning about), and
 the history breakpoint goes on the **last** turn, not the last *completed* turn (Anthropic's own
 multi-turn guidance says the most-recently-appended turn, which caches strictly more). §7's open
-questions are now answered — see the notes inline. Remaining: validate in Kippy (§8).
+questions are now answered — see the notes inline. Remaining: validate in a real consumer (§8).
 **Author's note:** written after measuring a real workload (see *Why now*). Every number below was
 measured or read from a provider doc — nothing here is from memory.
 
@@ -19,7 +19,7 @@ measured or read from a provider doc — nothing here is from memory.
 
 ## 1. Why now
 
-Kippy (the primary consumer) files a family's documents and answers questions about them. Measured
+The reference consumer files documents and answers questions about them. Measured
 on a real 58-page Hebrew PDF (Bituach Leumi claim, 4.1 MB), against `claude-sonnet-4-6`:
 
 | Call | Input tokens | Cost |
@@ -34,7 +34,7 @@ document block with no `cache_control`, and `MediaPart` has no field to request 
 
 Two more gaps found while looking:
 
-1. **The only caching maslul supports today is an Anthropic-shaped escape hatch.** Kippy caches its
+1. **The only caching maslul supports today is an Anthropic-shaped escape hatch.** A consumer caches its
    persona by hand-building Anthropic content blocks and smuggling them through
    `provider_options["system"]` (see `router.py::_with_guidance`, which explicitly knows about
    "Anthropic structured system: a list of content blocks (often cache_control-marked)"). Gemini
@@ -54,7 +54,7 @@ Two more gaps found while looking:
    | Gemini | `prompt_token_count` | **Yes** |
 
    So `input_tokens + cache_read_input_tokens` double-counts on three providers and is correct on
-   one. Any cost or context-size math built on `Usage` — including Kippy's usage-metrics hook — is
+   one. Any cost or context-size math built on `Usage` — including a consumer's usage-metrics hook — is
    wrong by the size of the cache hit, in a way that gets *worse* the better caching works. This is
    a bug today, before any of the rest of this plan is built, and it will quietly corrupt exactly
    the dashboard we would use to prove caching works.
@@ -229,7 +229,7 @@ These are the things a caching PR will break if it is written without reading `r
 1. **The cache is model-scoped; the router picks the model.** A cache written on the `simple` tier
    is cold on `hard`. If `CLASSIFY_AND_ANSWER` escalates, the write premium (1.25×) is paid for
    nothing. **Rule:** only emit cache markers when the model is *pinned* (`complete(req,
-   model=...)`) or the strategy cannot escalate. Kippy's document path pins the vision model, so it
+   model=...)`) or the strategy cannot escalate. A document path that pins its vision model, so it
    qualifies; the conversation path escalates, so it should cache the system prefix only (cheap to
    re-write) and never the media.
 
@@ -240,7 +240,7 @@ These are the things a caching PR will break if it is written without reading `r
    cache hit downstream. Add a test that asserts the rendered guidance is byte-stable.
 
 3. **Tool definitions render before system on Anthropic.** So a caller that changes the tool set
-   per-turn (Kippy adds admin tools only for the admin) gets a different prefix per user and shares
+   per-turn (e.g. admin-only tools for one user) gets a different prefix per user and shares
    nothing. Worth documenting; not worth fixing in maslul.
 
 4. **The response cache (`cache.py`) sits in front.** On a response-cache hit no provider call
@@ -258,7 +258,7 @@ Each phase is independently shippable and independently valuable.
 |---|---|---|---|
 | **1. Accounting** | Make `input_tokens` / `cache_read` / `cache_creation` disjoint on all four providers (§3.4) | low (public-field semantics change → CHANGELOG) | Cost math stops being wrong. Must land **before** the rest, or we cannot measure whether the rest worked |
 | **2. Layout** | `ContextCache` type + stable-first ordering + `key` → OpenAI/Grok affinity | low | The full win on Gemini/OpenAI/Grok, with **zero** provider-specific caching code |
-| **3. Anthropic** | `cache_control` breakpoints (system, media, history) + the 4-breakpoint budget | medium | The measured 10× on Kippy's document path — the reason this plan exists |
+| **3. Anthropic** | `cache_control` breakpoints (system, media, history) + the 4-breakpoint budget | medium | The measured 10× on a real document path — the reason this plan exists |
 | **4. Gemini explicit** | `client.caches.create()` + cache-handle lifecycle | high (introduces state maslul has never had) | ~~Only if phase 2's implicit caching proves insufficient — **measure first**~~ **Measured 2026-09-04: it is insufficient in the 4,096–10,000 token band. See §7.2.** |
 
 ~~Phase 4 may never be needed. Do not build it speculatively: Gemini caches implicitly, and phase 2
@@ -307,7 +307,7 @@ is in the docs:
 2. **Gemini explicit `CachedContent` → RE-OPENED 2026-09-04. The measurement came back, and
    implicit caching is insufficient for a tool-using agent.** Phase 4 shipped as not-built on the
    reasoning that implicit caching "may already capture all of it". Measured against
-   `gemini-3.8-flash` on Vertex (kippy-499107/global), it captures none of it at realistic size:
+   `gemini-3.8-flash` on Vertex, it captures none of it at realistic size:
 
    | stable prefix | implicit `cache_read` | explicit `CachedContent` |
    |---|---|---|
@@ -347,12 +347,12 @@ is in the docs:
 
 ## 8. Validation before release
 
-Per the project rule: **integrate in Kippy via a git dependency and validate there before any PyPI
-release.** The acceptance test is concrete and already has a fixture — Kippy's 58-page document:
+Per the project rule: **integrate in a real consumer via a git dependency and validate there before
+any PyPI release.** The acceptance test is concrete and has a fixture — a 58-page document:
 
 1. Ask a question about it. Expect `cache_creation_input_tokens ≈ 100,000`, cost ≈ $0.375.
 2. Ask a second question within the TTL. Expect `cache_read_input_tokens ≈ 100,000`,
    `input_tokens` ≈ the question only, cost ≈ **$0.03**.
-3. Confirm Kippy's usage-metrics hook reports the saving rather than a phantom re-spend.
+3. Confirm the consumer's usage-metrics hook reports the saving rather than a phantom re-spend.
 
 If step 2 does not show a read, the feature does not work — regardless of what the unit tests say.

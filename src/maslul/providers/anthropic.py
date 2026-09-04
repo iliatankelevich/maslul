@@ -111,7 +111,7 @@ class AnthropicProvider:
             output_config = dict(kwargs.get("output_config") or {})
             output_config["format"] = {"type": "json_schema", "schema": req.response_format}
             kwargs["output_config"] = output_config
-        # A caller-pinned system (provider_options — Kippy's hand-built content blocks) *overrides*
+        # A caller-pinned system (hand-built content blocks via provider_options) *overrides*
         # ours, so our block is now an orphan: don't mark or count it.
         if kwargs.get("system") is not system_blocks:
             system_block = None

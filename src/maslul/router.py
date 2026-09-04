@@ -57,7 +57,7 @@ from maslul.types import (
     Verifier,
 )
 
-# Guard against a runaway tool loop (mirrors Kippy's llm.py).
+# Guard against a runaway tool loop.
 _MAX_TOOL_ITERATIONS = 8
 # Headroom for a classify call — small, but enough for a thinking classifier to reason then label.
 _CLASSIFY_MAX_TOKENS = 512

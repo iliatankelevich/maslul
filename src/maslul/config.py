@@ -106,7 +106,7 @@ def _parse_level(value: str | Level) -> Level:
 
 def _model_spec(entry: Mapping[str, Any]) -> ModelSpec:
     """A tier/classifier entry: either split ``provider``+``model`` keys, or a single
-    ``model = "provider:model"`` shorthand (identical to Kippy's ``[models]`` format).
+    ``model = "provider:model"`` shorthand.
     """
     if "provider" in entry:
         return ModelSpec(

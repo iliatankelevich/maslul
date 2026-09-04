@@ -59,7 +59,7 @@ class ModelSpec:
     def parse(cls, spec: str) -> ModelSpec:
         """Parse the canonical ``"provider:model"`` string.
 
-        The same format as Kippy's ``[models]`` table: the ``provider`` prefix tells Maslul
+        The ``provider`` prefix tells Maslul
         which SDK to dispatch to. Raises :class:`ConfigError` on a malformed spec or an
         unknown provider.
         """
