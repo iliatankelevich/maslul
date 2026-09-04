@@ -436,8 +436,8 @@ async def test_anthropic_long_ttl_opts_into_the_one_hour_cache() -> None:
 
 
 async def test_anthropic_never_exceeds_four_breakpoints() -> None:
-    """All three markers at once on a single-turn document-QA request — the exact shape Kippy
-    sends. Three distinct blocks get marked, which is inside the budget of four."""
+    """All three markers at once on a single-turn document-QA request — the shape a real
+    consumer sends. Three distinct blocks get marked, which is inside the budget of four."""
     fake = _FakeAnthropic(_anthropic_resp())
     await AnthropicProvider(client=fake).complete(
         _ANTHROPIC,
@@ -459,7 +459,7 @@ async def test_anthropic_never_exceeds_four_breakpoints() -> None:
 
 
 async def test_anthropic_counts_caller_markers_against_the_budget() -> None:
-    """A caller hand-building a cached system through provider_options (Kippy's escape hatch) still
+    """A caller hand-building a cached system through provider_options (the escape hatch) still
     owns those breakpoints; ours must budget around them rather than 400 the request."""
     fake = _FakeAnthropic(_anthropic_resp())
     pinned = [
@@ -569,7 +569,7 @@ async def _result() -> str:
 
 
 # --- block order INSIDE the media message — the flow the whole feature exists for -------------
-# Kippy's document-QA turn is a SINGLE user message carrying both the question and the PDF. So
+# A document-QA turn is typically a SINGLE user message carrying both the question and the PDF. So
 # "attach media to the first user message" is a no-op there (first == last), and what actually
 # decides whether the cache can ever hit is the order of blocks *within* that message: a breakpoint
 # on the document caches everything before it, so a question emitted first lands inside the prefix

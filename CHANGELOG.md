@@ -144,8 +144,9 @@ entirely; this makes the model call but bills the prefix it has already seen at 
   *is* the last), and the rendered blocks were `[text(question), document(pdf)]`. A breakpoint on the
   document therefore cached a prefix that **began with the volatile question**, so every new question
   was a fresh prefix and the hit rate was **zero**. Emitting `[document, text]` puts the stable
-  document first, where a prefix cache can reach it. Measured against the live API on the exact
-  Kippy shape: a follow-up question about a 79k-token PDF went **$0.237 → $0.024 (9.9×)**. Anthropic
+  document first, where a prefix cache can reach it. Measured against the live API on a real
+  document-QA workload: a follow-up question about a 79k-token PDF went **$0.237 → $0.024
+  (9.9×)**. Anthropic
   independently recommends document-before-text, so this costs no answer quality.
 - **Anthropic `cache_control` breakpoints** — the only provider that requires explicit markers.
   `system` marks the last system block (which caches **tools + system** together, since tools render

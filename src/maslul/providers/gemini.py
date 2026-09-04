@@ -1,6 +1,6 @@
 """Gemini provider — Google ``google-genai`` SDK via Vertex AI.
 
-Mirrors Kippy's auth pattern: Vertex AI + Application Default Credentials (no API key) when
+Auth follows the Vertex pattern: Application Default Credentials (no API key) when
 ``vertex_project`` is set; an API-key path is supported for the Gemini Developer API. Covers
 plain-text completion (M1) and tool-use translation (M2): function declarations, the
 ``function_call``/``function_response`` round-trip, normalized usage, and finish reason.

@@ -1,6 +1,6 @@
 """Live provider smoke tests — make one real, cheap API call per provider.
 
-Each is gated on its credentials and skips cleanly when absent (like Kippy's ``make doctor``),
+Each is gated on its credentials and skips cleanly when absent,
 so the default ``pytest`` run is hermetic on a machine with no keys. Override the model per
 provider with the ``MASLUL_*_MODEL`` env vars when the catalog moves.
 """
