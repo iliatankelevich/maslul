@@ -26,6 +26,10 @@ All notable changes to **maslul** are documented here. The format follows
   `maslul.jev.hooks_from_config()` builds both from a `[maslul.jev]` config table; `Router` has no
   generic hook-plugin registry, so this is a documented factory rather than a config-wired path,
   and an explicitly-injected `Router(classifier=..., verifier=...)` always wins.
+- **Level descriptions are concrete examples, and configurable** (`[maslul.jev.criteria]`,
+  `question`, `verify_question`). Abstract wording never let `hard` win: three clearly hard requests
+  came back `medium` at 0.48 to 0.78 in English and Hebrew alike, and came back `hard` at 0.97 to
+  0.99 with the new defaults. An unknown level name in `criteria` raises `ConfigError`.
 
 ## [0.4.0] - 2026-09-04
 

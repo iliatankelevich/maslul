@@ -28,6 +28,7 @@ from typing import Any, Literal
 
 import httpx
 
+from maslul.errors import ConfigError
 from maslul.types import Classifier, Level, Request, Response, Usage, Verifier
 
 logger = logging.getLogger(__name__)
@@ -39,10 +40,25 @@ _DEFAULT_TIMEOUT = 5.0  # on the hot path of every chat turn; fail fast and defe
 _LEVEL_OPTION = {Level.SIMPLE: "simple", Level.MEDIUM: "medium", Level.HARD: "hard"}
 _OPTION_LEVEL = {v: k for k, v in _LEVEL_OPTION.items()}
 
+# Concrete examples per level, not adjectives. Abstract descriptions ("moderate reasoning", "deep
+# reasoning") never let HARD win: measured 2026-10-01, a week-by-week moving plan, a savings split
+# and an insurance comparison all came back MEDIUM at 0.48-0.78, in English and Hebrew alike. With
+# these, the same requests came back HARD at 0.97-0.99 and the easy ones stayed SIMPLE. The wording
+# moves the decision far more than the language does, which is why it is configurable.
 _DEFAULT_LEVEL_CRITERIA: dict[Level, str] = {
-    Level.SIMPLE: "Trivial lookups, greetings, reformatting — easy to answer correctly.",
-    Level.MEDIUM: "Moderate or short multi-step reasoning.",
-    Level.HARD: "Deep reasoning, research, analysis, or an ambiguous/high-stakes request.",
+    Level.SIMPLE: (
+        "Small talk, thanks or a greeting; a single fact or definition; a short translation; "
+        "a one-step action such as setting a reminder or editing a list."
+    ),
+    Level.MEDIUM: (
+        "A short explanation; drafting a short message; looking something up in the user's own "
+        "records; a recommendation among a few options."
+    ),
+    Level.HARD: (
+        "Any request that needs a multi-part plan, a comparison of several options with "
+        "trade-offs, financial, legal or medical advice, or reasoning over many documents or "
+        "messages — even when it is phrased briefly."
+    ),
 }
 _DEFAULT_CLASSIFY_QUESTION = (
     "How much reasoning capability does an assistant need to answer the user's latest message in "
@@ -289,20 +305,36 @@ def hooks_from_config(config: Mapping[str, Any]) -> JevHooks:
     timeout = 5.0                      # optional, seconds
     classifier = true                  # build a JevClassifier
     min_confidence = 0.7               # optional, JevClassifier gate
+    question = "..."                   # optional, the classify question
     verifier = true                    # build a JevVerifier
     min_yes = 0.7                      # optional, JevVerifier gate
     on_error = "accept"                # optional, JevVerifier failure policy
+    verify_question = "..."            # optional, the verify question
+
+    [maslul.jev.criteria]              # optional, what each level means; replaces the defaults
+    simple = "..."
+    medium = "..."
+    hard = "..."
     ```
+
+    Raises :class:`~maslul.errors.ConfigError` on a ``criteria`` key that is not a level, rather
+    than silently classifying against a description nobody wrote.
     """
     root = config.get("maslul", config)
     raw = root.get("jev")
     # A table that asks for neither hook must not demand an API key just to build a client.
     if not raw or not (raw.get("classifier") or raw.get("verifier")):
         return JevHooks(classifier=None, verifier=None)
+    criteria = _criteria_from_config(raw.get("criteria"))
     client_kwargs = {k: raw[k] for k in ("api_key_env", "base_url", "model", "timeout") if k in raw}
     client = JevClient(**client_kwargs)
     classifier = (
-        JevClassifier(client, min_confidence=float(raw.get("min_confidence", 0.7)))
+        JevClassifier(
+            client,
+            min_confidence=float(raw.get("min_confidence", 0.7)),
+            level_criteria=criteria,
+            question=raw.get("question", _DEFAULT_CLASSIFY_QUESTION),
+        )
         if raw.get("classifier")
         else None
     )
@@ -311,11 +343,21 @@ def hooks_from_config(config: Mapping[str, Any]) -> JevHooks:
             client,
             min_yes=float(raw.get("min_yes", 0.7)),
             on_error=raw.get("on_error", "accept"),
+            question=raw.get("verify_question", _DEFAULT_VERIFY_QUESTION),
         )
         if raw.get("verifier")
         else None
     )
     return JevHooks(classifier=classifier, verifier=verifier, client=client)
+
+
+def _criteria_from_config(raw: Mapping[str, Any] | None) -> dict[Level, str] | None:
+    if not raw:
+        return None
+    unknown = set(raw) - set(_OPTION_LEVEL)
+    if unknown:
+        raise ConfigError(f"[maslul.jev.criteria] has unknown level(s): {sorted(unknown)}")
+    return {_OPTION_LEVEL[name]: str(text) for name, text in raw.items()}
 
 
 def _conversation_state(req: Request, history_window: int, char_cap: int) -> str:

@@ -296,11 +296,16 @@ never looks at `[maslul.jev]`, so an explicitly-injected hook always wins. Every
 resolved as `None` (classifier) / `on_error`'s policy (verifier, default `"accept"`) — an outage of
 this optional hook never breaks routing.
 
-**English is Jev's primary training language; Hebrew and other languages are "handled but not
-equally well"** (TypeSafe's own docs). `min_confidence` / `min_yes` need calibrating per
-language/workload — `await classifier.decide(req)` / `await verifier.judge(req, resp)` return the
-raw decision (level or `p_yes`, probabilities, confidence, model, usage) so you can log it in
-shadow mode before trusting it.
+**The level descriptions matter more than the language.** With abstract descriptions ("moderate
+reasoning", "deep reasoning"), a week-by-week moving plan, a savings split and an insurance
+comparison all came back `medium`, in English and Hebrew alike. With concrete examples per level
+(the defaults now), the same requests come back `hard` at 0.97 to 0.99 confidence. Override them
+for your workload in `[maslul.jev.criteria]` (`simple`/`medium`/`hard`), or with `level_criteria=`.
+
+English is Jev's primary training language, and TypeSafe says other languages are "handled but not
+equally well". So calibrate `min_confidence` and `min_yes` on your own traffic:
+`await classifier.decide(req)` and `await verifier.judge(req, resp)` return the raw decision (level
+or `p_yes`, probabilities, confidence, model, usage) without applying the gate.
 
 ## Status
 

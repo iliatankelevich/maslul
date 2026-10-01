@@ -14,6 +14,7 @@ from typing import Any
 import httpx
 import pytest
 
+from maslul.errors import ConfigError
 from maslul.jev import JevClassifier, JevClient, JevVerifier, hooks_from_config
 from maslul.types import Level, Message, Request, Response, Usage
 
@@ -277,3 +278,39 @@ async def test_hooks_from_config_client_can_be_closed(monkeypatch: pytest.Monkey
     assert hooks.client is not None
     await hooks.aclose()
     assert hooks.client._client.is_closed
+
+
+async def test_hooks_from_config_sends_the_configured_criteria(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("TYPESAFE_API_KEY", "test-key")
+    sent: list[dict[str, Any]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        sent.append(json.loads(request.content))
+        return _choice_handler("hard", 0.99)(request)
+
+    config = {
+        "maslul": {
+            "jev": {
+                "classifier": True,
+                "question": "How hard is it?",
+                "criteria": {"simple": "thanks", "medium": "a short draft", "hard": "a plan"},
+            }
+        }
+    }
+    hooks = hooks_from_config(config)
+    assert isinstance(hooks.classifier, JevClassifier)
+    hooks.classifier._client = _client(handler)  # the configured hook, served by a fake
+    assert await hooks.classifier(_req("תכנן לי מעבר דירה")) is Level.HARD
+    question = sent[0]["questions"]["level"]
+    assert question["instructions"] == "How hard is it?"
+    assert question["criteria"] == {"simple": "thanks", "medium": "a short draft", "hard": "a plan"}
+
+
+def test_hooks_from_config_rejects_an_unknown_criteria_level(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("TYPESAFE_API_KEY", "test-key")
+    with pytest.raises(ConfigError, match="hrad"):
+        hooks_from_config({"maslul": {"jev": {"classifier": True, "criteria": {"hrad": "x"}}}})
