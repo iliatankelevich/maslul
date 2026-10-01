@@ -272,6 +272,41 @@ custom wiring.
 | `grok` | `xai-sdk` | `XAI_API_KEY` |
 | `openai` | `openai` | `OPENAI_API_KEY` |
 
+## Jev hooks (optional)
+
+[TypeSafe Jev](https://docs.typesafe.ai) is not an LLM provider — it returns typed, calibrated
+decisions (a choice between levels, a yes/no probability), not text — so it plugs into the
+*hook* contract instead of `Provider`. `maslul[jev]` (`httpx`) adds `JevClassifier` (a
+`classifier` hook) and `JevVerifier` (a `verifier` hook, for `VERIFY_CASCADE`):
+
+```python
+from maslul.jev import JevClassifier, JevVerifier
+
+router = Router.from_toml(
+    "maslul.toml",
+    classifier=JevClassifier(min_confidence=0.7),   # api_key from TYPESAFE_API_KEY
+    verifier=JevVerifier(min_yes=0.7, on_error="accept"),
+)
+```
+
+Or build both from a `[maslul.jev]` config table with `maslul.jev.hooks_from_config(config)` —
+`Router` has no generic hook-plugin registry, so this is a plain factory: it reads the table and
+returns the hooks for you to pass into `Router(classifier=..., verifier=...)`; `Router` itself
+never looks at `[maslul.jev]`, so an explicitly-injected hook always wins. Every call is caught and
+resolved as `None` (classifier) / `on_error`'s policy (verifier, default `"accept"`) — an outage of
+this optional hook never breaks routing.
+
+**The level descriptions matter more than the language.** With abstract descriptions ("moderate
+reasoning", "deep reasoning"), a week-by-week moving plan, a savings split and an insurance
+comparison all came back `medium`, in English and Hebrew alike. With concrete examples per level
+(the defaults now), the same requests come back `hard` at 0.97 to 0.99 confidence. Override them
+for your workload in `[maslul.jev.criteria]` (`simple`/`medium`/`hard`), or with `level_criteria=`.
+
+English is Jev's primary training language, and TypeSafe says other languages are "handled but not
+equally well". So calibrate `min_confidence` and `min_yes` on your own traffic:
+`await classifier.decide(req)` and `await verifier.judge(req, resp)` return the raw decision (level
+or `p_yes`, probabilities, confidence, model, usage) without applying the gate.
+
 ## Status
 
 Beta (`0.2.x`), fully typed (`py.typed`), async-first. Routing, tool use, structured output,

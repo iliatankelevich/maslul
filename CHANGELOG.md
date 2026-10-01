@@ -6,6 +6,31 @@ All notable changes to **maslul** are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-10-01
+
+### Added
+
+- **TypeSafe Jev hooks (`maslul[jev]`, `httpx`).** `JevClassifier` and `JevVerifier` — a
+  `classifier` and a `verifier` hook backed by TypeSafe's System One API
+  (https://docs.typesafe.ai). Jev is not an LLM provider (it returns typed, calibrated decisions,
+  never text), so it plugs into the hook contract rather than `Provider`. `JevClassifier` asks one
+  Choice question over the router's levels and returns a `Level` only above a configurable
+  `min_confidence`; `JevVerifier` asks one Noul (yes/no probability) question for
+  `VERIFY_CASCADE` and gates on `min_yes`. Both build a bounded, text-only conversation window as
+  Jev's `state` (char-capped well under its 32k-token budget) and never raise into the router — any
+  transport error, timeout, 429/529, or malformed answer resolves to `None` (classifier) or
+  `on_error`'s policy (verifier, default `accept`, so an outage never doubles cost by escalating
+  every turn). `decide()` / `judge()` expose the raw decision (probabilities, confidence, model,
+  usage) for shadow-mode logging and threshold calibration — Jev's docs note English is its primary
+  training language and other languages, including Hebrew, are "handled but not equally well".
+  `maslul.jev.hooks_from_config()` builds both from a `[maslul.jev]` config table; `Router` has no
+  generic hook-plugin registry, so this is a documented factory rather than a config-wired path,
+  and an explicitly-injected `Router(classifier=..., verifier=...)` always wins.
+- **Level descriptions are concrete examples, and configurable** (`[maslul.jev.criteria]`,
+  `question`, `verify_question`). Abstract wording never let `hard` win: three clearly hard requests
+  came back `medium` at 0.48 to 0.78 in English and Hebrew alike, and came back `hard` at 0.97 to
+  0.99 with the new defaults. An unknown level name in `criteria` raises `ConfigError`.
+
 ## [0.4.0] - 2026-09-04
 
 ### Added
