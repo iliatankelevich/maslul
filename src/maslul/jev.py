@@ -261,10 +261,16 @@ class JevVerifier:
 @dataclass(frozen=True)
 class JevHooks:
     """Hooks built by :func:`hooks_from_config`; pass straight into ``Router(classifier=hooks
-    .classifier, verifier=hooks.verifier)``. Either may be ``None`` when not requested."""
+    .classifier, verifier=hooks.verifier)``. Either may be ``None`` when not requested, and
+    ``client`` is ``None`` when neither was. Call :meth:`aclose` when the router is discarded."""
 
     classifier: Classifier | None
     verifier: Verifier | None
+    client: JevClient | None = None
+
+    async def aclose(self) -> None:
+        if self.client is not None:
+            await self.client.aclose()
 
 
 def hooks_from_config(config: Mapping[str, Any]) -> JevHooks:
@@ -290,7 +296,8 @@ def hooks_from_config(config: Mapping[str, Any]) -> JevHooks:
     """
     root = config.get("maslul", config)
     raw = root.get("jev")
-    if not raw:
+    # A table that asks for neither hook must not demand an API key just to build a client.
+    if not raw or not (raw.get("classifier") or raw.get("verifier")):
         return JevHooks(classifier=None, verifier=None)
     client_kwargs = {k: raw[k] for k in ("api_key_env", "base_url", "model", "timeout") if k in raw}
     client = JevClient(**client_kwargs)
@@ -308,7 +315,7 @@ def hooks_from_config(config: Mapping[str, Any]) -> JevHooks:
         if raw.get("verifier")
         else None
     )
-    return JevHooks(classifier=classifier, verifier=verifier)
+    return JevHooks(classifier=classifier, verifier=verifier, client=client)
 
 
 def _conversation_state(req: Request, history_window: int, char_cap: int) -> str:

@@ -23,15 +23,11 @@ def _req(*messages: str) -> Request:
 
 
 def _resp(text: str) -> Response:
-    return Response(
-        text=text, level_used=None, provider="fake", model="fake", usage=Usage()
-    )
+    return Response(text=text, level_used=None, provider="fake", model="fake", usage=Usage())
 
 
 def _client(handler: Any, **kwargs: Any) -> JevClient:
-    return JevClient(
-        api_key="test-key", transport=httpx.MockTransport(handler), **kwargs
-    )
+    return JevClient(api_key="test-key", transport=httpx.MockTransport(handler), **kwargs)
 
 
 def _choice_handler(choice: str, confidence: float, probabilities: dict[str, float] | None = None):
@@ -80,9 +76,6 @@ def _status_handler(status: int):
 
 def _timeout_handler(request: httpx.Request) -> httpx.Response:
     raise httpx.TimeoutException("simulated timeout", request=request)
-
-
-# --- JevClassifier -------------------------------------------------------------------------
 
 
 async def test_confident_choice_returns_level() -> None:
@@ -153,9 +146,6 @@ async def test_on_decision_fires_even_on_failure() -> None:
     assert seen[0].level is None
 
 
-# --- state construction ---------------------------------------------------------------------
-
-
 async def test_state_window_and_char_cap_keep_the_latest_message() -> None:
     captured: dict[str, Any] = {}
 
@@ -216,9 +206,6 @@ async def test_hebrew_state_passes_through_unmangled() -> None:
     assert hebrew in captured["body"]["state"]
 
 
-# --- JevVerifier -----------------------------------------------------------------------------
-
-
 async def test_confident_yes_accepts() -> None:
     verifier = JevVerifier(_client(_noul_handler(0.95)), min_yes=0.7)
     assert await verifier(_req("question"), _resp("a good answer")) is True
@@ -242,9 +229,6 @@ async def test_verifier_on_error_reject() -> None:
 async def test_verifier_timeout_defaults_to_accept() -> None:
     verifier = JevVerifier(_client(_timeout_handler))
     assert await verifier(_req("q"), _resp("a")) is True
-
-
-# --- hooks_from_config -----------------------------------------------------------------------
 
 
 def test_hooks_from_config_empty_without_jev_table(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -277,3 +261,19 @@ def test_hooks_from_config_classifier_only(monkeypatch: pytest.MonkeyPatch) -> N
     hooks = hooks_from_config({"maslul": {"jev": {"classifier": True}}})
     assert hooks.classifier is not None
     assert hooks.verifier is None
+
+
+def test_hooks_from_config_without_a_requested_hook_needs_no_key(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("TYPESAFE_API_KEY", raising=False)
+    hooks = hooks_from_config({"maslul": {"jev": {"timeout": 2.0}}})
+    assert hooks.classifier is None and hooks.verifier is None and hooks.client is None
+
+
+async def test_hooks_from_config_client_can_be_closed(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("TYPESAFE_API_KEY", "test-key")
+    hooks = hooks_from_config({"maslul": {"jev": {"classifier": True, "verifier": True}}})
+    assert hooks.client is not None
+    await hooks.aclose()
+    assert hooks.client._client.is_closed
