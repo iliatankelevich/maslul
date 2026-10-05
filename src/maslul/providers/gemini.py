@@ -21,7 +21,13 @@ from google import genai
 from google.genai import types
 
 from maslul.errors import AuthError, ProviderError, RateLimited, Timeout
-from maslul.providers._common import media_first, media_index, split_input
+from maslul.providers._common import (
+    generation_params,
+    media_first,
+    media_index,
+    raw_options,
+    split_input,
+)
 from maslul.types import ContextCache, ModelSpec, Request, Response, ToolCall, Usage
 
 log = logging.getLogger(__name__)
@@ -58,16 +64,24 @@ class GeminiProvider:
         self._handles: OrderedDict[str, tuple[str, float]] = OrderedDict()
 
     async def complete(self, spec: ModelSpec, req: Request) -> Response:
+        params = generation_params(spec, req)
         config: dict[str, Any] = {}
         if req.system:
             config["system_instruction"] = "\n\n".join(req.system)
-        max_tokens = req.max_tokens or spec.max_tokens
-        if max_tokens:
-            config["max_output_tokens"] = max_tokens
-        if req.temperature is not None:
-            config["temperature"] = req.temperature
-        if req.stop:
-            config["stop_sequences"] = req.stop
+        if params.max_tokens:
+            config["max_output_tokens"] = params.max_tokens
+        for key in ("temperature", "top_p", "top_k", "seed"):
+            value = getattr(params, key)
+            if value is not None:
+                config[key] = value
+        if params.stop:
+            config["stop_sequences"] = params.stop
+        if params.reasoning is not None:
+            # Gemini 3's thinking_level. Gemini 2.5 takes a thinking_budget instead — set it raw,
+            # in the tier's options (thinking_config = { thinking_budget = ... }).
+            config["thinking_config"] = types.ThinkingConfig(
+                thinking_level=types.ThinkingLevel[params.reasoning.upper()]
+            )
         if req.response_format is not None:
             config["response_mime_type"] = "application/json"
             config["response_json_schema"] = req.response_format
@@ -91,6 +105,13 @@ class GeminiProvider:
             tools.append(types.Tool(google_search=types.GoogleSearch()))
         if tools:
             config["tools"] = tools
+        if req.tools and params.tool_choice not in (None, "auto"):  # auto is Gemini's default
+            config["tool_config"] = _tool_config(params.tool_choice)
+        # Raw options override the generic ones above: the tier's GenerateContentConfig fields,
+        # then the request's provider_options — only its "gemini" entry, since callers put
+        # Anthropic-shaped values in the unscoped form, which a mixed-provider router can send here.
+        config.update(spec.options)
+        config.update(raw_options(self.name, req.provider_options, unscoped=False))
         # Phase 4: explicit CachedContent. Opt-in — only when the caller declared a TTL, because
         # this is the one path that creates server-side state. Everything stable (system + ALL
         # tools) moves into the cache: Vertex rejects a request that sets `cached_content` together
@@ -158,6 +179,11 @@ class GeminiProvider:
             return None
         if "system_instruction" not in config and "tools" not in config:
             return None  # nothing stable to put in it
+        if "tool_config" in config:
+            # Vertex refuses tool_config next to cached_content, and a forced tool choice is
+            # per-turn (the router resets it after the first turn), so caching it would mint a
+            # new CachedContent per turn. Send this one uncached.
+            return None
 
         key = cc.key or _cache_key(spec.model, config)
         now = time.monotonic()
@@ -367,6 +393,19 @@ def _map_error(e: Exception) -> Exception:
     if code in (401, 403):
         return AuthError(str(e))
     return ProviderError(str(e))
+
+
+def _tool_config(choice: str) -> types.ToolConfig:
+    """Generic tool choice → Gemini's function-calling mode; a tool name is ANY, limited to it."""
+    if choice == "none":
+        mode = types.FunctionCallingConfigMode.NONE
+        return types.ToolConfig(function_calling_config=types.FunctionCallingConfig(mode=mode))
+    names = None if choice == "required" else [choice]
+    return types.ToolConfig(
+        function_calling_config=types.FunctionCallingConfig(
+            mode=types.FunctionCallingConfigMode.ANY, allowed_function_names=names
+        )
+    )
 
 
 def _cache_key(model: str, config: dict[str, Any]) -> str:

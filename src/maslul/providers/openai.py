@@ -17,7 +17,13 @@ import openai
 from openai import AsyncOpenAI
 
 from maslul.errors import AuthError, ProviderError, RateLimited, Timeout
-from maslul.providers._common import media_first, media_index, split_input
+from maslul.providers._common import (
+    generation_params,
+    media_first,
+    media_index,
+    raw_options,
+    split_input,
+)
 from maslul.types import (
     ContextCache,
     MediaPart,
@@ -30,6 +36,8 @@ from maslul.types import (
 )
 
 _DEFAULT_MAX_TOKENS = 1024
+# Reasoning tokens count against max_completion_tokens, so 1024 would truncate most answers.
+_DEFAULT_REASONING_MAX_TOKENS = 16000
 # ``ttl_seconds`` at or above this opts into OpenAI's extended (24-hour) cache retention.
 _LONG_TTL_SECONDS = 3600
 
@@ -45,13 +53,15 @@ class OpenAIProvider:
         self._client: Any = client or (AsyncOpenAI(api_key=api_key) if api_key else AsyncOpenAI())
 
     async def complete(self, spec: ModelSpec, req: Request) -> Response:
+        params = generation_params(spec, req)
         messages = _to_messages(req.messages, req.media, req.context_cache)
         if req.system:
             messages = [{"role": "system", "content": "\n\n".join(req.system)}, *messages]
+        default_max = _DEFAULT_REASONING_MAX_TOKENS if params.reasoning else _DEFAULT_MAX_TOKENS
         kwargs: dict[str, Any] = {
             "model": spec.model,
             "messages": messages,
-            "max_completion_tokens": req.max_tokens or spec.max_tokens or _DEFAULT_MAX_TOKENS,
+            "max_completion_tokens": params.max_tokens or default_max,
         }
         if req.tools:
             kwargs["tools"] = [
@@ -65,15 +75,26 @@ class OpenAIProvider:
                 }
                 for t in req.tools
             ]
+            if params.tool_choice is not None:
+                kwargs["tool_choice"] = _tool_choice(params.tool_choice)
         if req.response_format is not None:
             kwargs["response_format"] = {
                 "type": "json_schema",
                 "json_schema": {"name": "response", "schema": req.response_format, "strict": False},
             }
-        if req.temperature is not None:
-            kwargs["temperature"] = req.temperature
-        if req.stop:
-            kwargs["stop"] = req.stop
+        if params.reasoning is not None:
+            # Reasoning models refuse temperature, top_p and stop (they are only accepted at
+            # reasoning_effort "none"), so they are dropped rather than sent to a guaranteed 400.
+            kwargs["reasoning_effort"] = params.reasoning
+        else:
+            if params.temperature is not None:
+                kwargs["temperature"] = params.temperature
+            if params.top_p is not None:
+                kwargs["top_p"] = params.top_p
+            if params.stop:
+                kwargs["stop"] = params.stop
+        if params.seed is not None:
+            kwargs["seed"] = params.seed  # top_k has no OpenAI equivalent and is ignored
         if req.web_search:  # search-capable models only (e.g. gpt-4o-search-preview)
             kwargs["web_search_options"] = {}
         # Prompt caching. OpenAI caches a matching prefix automatically — the stable-first ordering
@@ -86,7 +107,7 @@ class OpenAIProvider:
             if cache.ttl_seconds is not None and cache.ttl_seconds >= _LONG_TTL_SECONDS:
                 kwargs["prompt_cache_retention"] = "24h"
         kwargs.update(spec.options)
-        kwargs.update(req.provider_options)
+        kwargs.update(raw_options(self.name, req.provider_options, unscoped=True))
         try:
             resp = await self._client.chat.completions.create(**kwargs)
         except Exception as e:  # noqa: BLE001 - normalized below
@@ -111,6 +132,13 @@ class OpenAIProvider:
             max_completion_tokens=1,
             messages=[{"role": "user", "content": "ping"}],
         )
+
+
+def _tool_choice(choice: str) -> Any:
+    """Generic tool choice → OpenAI's: the three modes pass through, a tool name forces it."""
+    if choice in ("auto", "required", "none"):
+        return choice
+    return {"type": "function", "function": {"name": choice}}
 
 
 def _to_messages(

@@ -256,7 +256,7 @@ async def test_classify_and_answer_guidance_reaches_pinned_provider_options_syst
     )
     await router.complete(req)
     _, seen = fake.calls[0]
-    # Injected into BOTH places: req.system (for Gemini/Grok/OpenAI) ...
+    # Injected into BOTH places: req.system (for Gemini/xAI/OpenAI) ...
     assert seen.system is not None
     assert seen.system[0] == _CLASSIFY_AND_ANSWER_GUIDANCE
     assert seen.system[1] == "base"
@@ -316,15 +316,15 @@ async def test_missing_provider_raises_config_error() -> None:
         await router.complete(_req(), level=Level.HARD)
 
 
-def _grok_heavy_config() -> dict[str, Any]:
+def _xai_heavy_config() -> dict[str, Any]:
     return {
         "maslul": {
             "strategy": "classify_and_answer",
             "default_level": "medium",
-            "classifier": {"provider": "grok", "model": "g-classify"},
+            "classifier": {"provider": "xai", "model": "g-classify"},
             "tiers": {
-                "simple": {"provider": "grok", "model": "g-small"},
-                "medium": {"provider": "grok", "model": "g-mid"},
+                "simple": {"provider": "xai", "model": "g-small"},
+                "medium": {"provider": "xai", "model": "g-mid"},
                 "hard": {"provider": "fake", "model": "big"},
             },
         }
@@ -332,18 +332,18 @@ def _grok_heavy_config() -> dict[str, Any]:
 
 
 async def test_degrade_remaps_unavailable_tiers_and_drops_classifier() -> None:
-    # Only "fake" is available; the grok tiers + grok classifier must degrade gracefully.
+    # Only "fake" is available; the xai tiers + xai classifier must degrade gracefully.
     router = Router(
-        _grok_heavy_config(),
+        _xai_heavy_config(),
         providers={"fake": FakeProvider("fake")},
         missing_provider="degrade",
     )
     cfg = router.config
-    # grok tiers remap to the nearest available higher tier (HARD = fake:big)
+    # xai tiers remap to the nearest available higher tier (HARD = fake:big)
     assert (cfg.tiers[Level.SIMPLE].provider, cfg.tiers[Level.SIMPLE].model) == ("fake", "big")
     assert cfg.tiers[Level.MEDIUM].model == "big"
     assert cfg.tiers[Level.HARD].model == "big"
-    assert cfg.classifier is None  # the grok classifier is dropped …
+    assert cfg.classifier is None  # the xai classifier is dropped …
     assert cfg.strategy is Strategy.ROUTE_DEFAULT  # … and the strategy downgrades
     resp = await router.complete(_req())  # routes without crashing
     assert resp.provider == "fake"
@@ -352,16 +352,16 @@ async def test_degrade_remaps_unavailable_tiers_and_drops_classifier() -> None:
 async def test_degrade_raises_when_no_tier_is_available() -> None:
     with pytest.raises(ConfigError, match="no configured tier"):
         Router(
-            _grok_heavy_config(),
+            _xai_heavy_config(),
             providers={"other": FakeProvider("other")},
             missing_provider="degrade",
         )
 
 
 async def test_error_mode_is_the_default_and_keeps_config_intact() -> None:
-    router = Router(_grok_heavy_config(), providers={"fake": FakeProvider("fake")})
-    assert router.config.tiers[Level.SIMPLE].provider == "grok"  # untouched
-    with pytest.raises(ConfigError):  # missing grok surfaces at call time
+    router = Router(_xai_heavy_config(), providers={"fake": FakeProvider("fake")})
+    assert router.config.tiers[Level.SIMPLE].provider == "xai"  # untouched
+    with pytest.raises(ConfigError):  # missing xai surfaces at call time
         await router.complete(_req(), level=Level.SIMPLE)
 
 
@@ -584,3 +584,60 @@ async def test_on_error_fires_per_failed_attempt() -> None:
     await router.complete(_req(), level=Level.SIMPLE)
     assert len(errors) == 2  # two transient failures before the success
     assert all(isinstance(e, RateLimited) for e in errors)
+
+
+async def test_forced_tool_choice_applies_to_the_first_turn_only() -> None:
+    call = ToolCall(id="c1", name="add", input={"a": 2, "b": 3})
+    provider = ScriptedProvider(
+        "fake",
+        [
+            Response("", None, "fake", "small", Usage(), tool_calls=[call]),
+            Response("It's 5.", None, "fake", "small", Usage()),
+        ],
+    )
+    router = Router(_config(), providers={"fake": provider})
+
+    async def executor(call: ToolCall) -> str:
+        return "5"
+
+    req = Request(
+        messages=[Message(role="user", content="2+3?")],
+        tools=[ToolDef(name="add", description="add", input_schema={"type": "object"})],
+        tool_executor=executor,
+        tool_choice="add",
+    )
+    resp = await router.complete(req, level=Level.SIMPLE)
+    assert resp.text == "It's 5."
+    # forced on turn 1; left to the model afterwards, or it could never stop calling the tool
+    assert [r.tool_choice for r in provider.requests] == ["add", None]
+
+
+async def test_response_cache_keys_on_generic_parameters() -> None:
+    config = {**_config()["maslul"], "cache": {"mode": "exact"}}
+    fake = FakeProvider("fake")
+    router = Router(config, providers={"fake": fake})
+    base = [Message(role="user", content="same question")]
+    await router.complete(Request(messages=base, reasoning="low"))
+    await router.complete(Request(messages=base, reasoning="high"))  # different answer depth
+    await router.complete(Request(messages=base, reasoning="high"))  # same as the last: a hit
+    assert len(fake.calls) == 2
+
+
+async def test_classify_and_answer_guidance_reaches_a_scoped_anthropic_system() -> None:
+    from maslul.router import _CLASSIFY_AND_ANSWER_GUIDANCE
+
+    fake = FakeProvider("fake", text="answered")
+    router = Router(
+        _classify_config("classify_and_answer", classifier_model="floor"), providers={"fake": fake}
+    )
+    persona = {"type": "text", "text": "PERSONA"}
+    req = Request(
+        messages=[Message(role="user", content="hi")],
+        provider_options={"anthropic": {"system": [persona]}, "gemini": {"seed": 1}},
+    )
+    await router.complete(req)
+    _, seen = fake.calls[0]
+    pinned = seen.provider_options["anthropic"]["system"]
+    assert pinned[0]["text"] == _CLASSIFY_AND_ANSWER_GUIDANCE
+    assert pinned[1] == persona
+    assert seen.provider_options["gemini"] == {"seed": 1}  # other entries untouched

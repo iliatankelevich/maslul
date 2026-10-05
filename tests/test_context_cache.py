@@ -14,10 +14,10 @@ from typing import Any
 from maslul.providers._common import split_input
 from maslul.providers.anthropic import AnthropicProvider
 from maslul.providers.gemini import GeminiProvider
-from maslul.providers.grok import GrokProvider
 from maslul.providers.openai import OpenAIProvider
+from maslul.providers.xai import XAIProvider
 from maslul.types import ContextCache, MediaPart, Message, ModelSpec, Request
-from tests.test_providers_unit import _FakeAnthropic, _FakeGemini, _FakeGrok, _FakeOpenAI
+from tests.test_providers_unit import _FakeAnthropic, _FakeGemini, _FakeOpenAI, _FakeXAI
 
 _ANTHROPIC = ModelSpec(provider="anthropic", model="claude-sonnet-4-6")
 _PDF = MediaPart(mime_type="application/pdf", data=b"%PDF-fake")
@@ -58,7 +58,7 @@ def _gemini_ok() -> Any:
     )
 
 
-def _grok_ok() -> Any:
+def _xai_ok() -> Any:
     return SimpleNamespace(
         content="ok",
         tool_calls=[],
@@ -131,15 +131,15 @@ async def test_openai_usage_subtracts_cached_from_the_prompt_total() -> None:
     assert out.usage.input_tokens + out.usage.cache_read_input_tokens == 100  # no double count
 
 
-async def test_grok_usage_subtracts_cached_from_the_prompt_total() -> None:
+async def test_xai_usage_subtracts_cached_from_the_prompt_total() -> None:
     resp = SimpleNamespace(
         content="ok",
         tool_calls=[],
         usage=SimpleNamespace(prompt_tokens=100, completion_tokens=5, cached_prompt_text_tokens=90),
         finish_reason="stop",
     )
-    out = await GrokProvider(client=_FakeGrok(resp)).complete(
-        ModelSpec(provider="grok", model="grok-4.3"),
+    out = await XAIProvider(client=_FakeXAI(resp)).complete(
+        ModelSpec(provider="xai", model="grok-4.3"),
         Request(messages=[Message(role="user", content="hi")]),
     )
     assert (out.usage.input_tokens, out.usage.cache_read_input_tokens) == (10, 90)
@@ -250,8 +250,8 @@ async def test_gemini_media_moves_to_the_first_user_message_when_cached() -> Non
     assert not any(getattr(p, "inline_data", None) is not None for p in contents[2].parts)
 
 
-async def test_grok_media_moves_to_the_first_user_message_when_cached() -> None:
-    fake = _FakeGrok(
+async def test_xai_media_moves_to_the_first_user_message_when_cached() -> None:
+    fake = _FakeXAI(
         SimpleNamespace(
             content="ok",
             tool_calls=[],
@@ -261,8 +261,8 @@ async def test_grok_media_moves_to_the_first_user_message_when_cached() -> None:
             finish_reason="stop",
         )
     )
-    await GrokProvider(client=fake).complete(
-        ModelSpec(provider="grok", model="grok-4.3"),
+    await XAIProvider(client=fake).complete(
+        ModelSpec(provider="xai", model="grok-4.3"),
         Request(
             messages=_CHAT,
             media=[MediaPart(mime_type="image/png", data=b"\x89PNG")],
@@ -301,11 +301,11 @@ async def test_gemini_media_stays_last_without_a_context_cache() -> None:
     assert any(getattr(p, "inline_data", None) is not None for p in contents[2].parts)
 
 
-async def test_grok_media_stays_last_without_a_context_cache() -> None:
-    """No-regression, Grok."""
-    fake = _FakeGrok(_grok_ok())
-    await GrokProvider(client=fake).complete(
-        ModelSpec(provider="grok", model="grok-4.3"),
+async def test_xai_media_stays_last_without_a_context_cache() -> None:
+    """No-regression, xAI."""
+    fake = _FakeXAI(_xai_ok())
+    await XAIProvider(client=fake).complete(
+        ModelSpec(provider="xai", model="grok-4.3"),
         Request(messages=_CHAT, media=[MediaPart(mime_type="image/png", data=b"\x89PNG")]),
     )
     sent = fake.calls[0]["messages"]
@@ -634,11 +634,11 @@ async def test_gemini_media_precedes_the_question_when_cached() -> None:
     assert getattr(parts[0], "text", None)
 
 
-async def test_grok_media_precedes_the_question_when_cached() -> None:
-    fake = _FakeGrok(_grok_ok())
+async def test_xai_media_precedes_the_question_when_cached() -> None:
+    fake = _FakeXAI(_xai_ok())
     img = MediaPart(mime_type="image/png", data=b"\x89PNG")
-    provider = GrokProvider(client=fake)
-    spec = ModelSpec(provider="grok", model="grok-4.3")
+    provider = XAIProvider(client=fake)
+    spec = ModelSpec(provider="xai", model="grok-4.3")
     await provider.complete(
         spec, Request(messages=_DOC_QA, media=[img], context_cache=ContextCache(media=True))
     )

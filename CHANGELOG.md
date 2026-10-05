@@ -6,6 +6,76 @@ All notable changes to **maslul** are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-10-05
+
+### Added
+
+- **Generic generation parameters, translated per provider.** `Request` gains `top_p`, `top_k`,
+  `seed`, `reasoning` (`"low"` / `"medium"` / `"high"`) and `tool_choice` (`"auto"` /
+  `"required"` / `"none"` / a tool name), next to the existing `max_tokens`, `temperature` and
+  `stop`. Each provider maps them onto its own SDK call and ignores the ones it has no equivalent
+  for (`seed` on Anthropic, `top_k` on OpenAI and xAI). `reasoning` becomes adaptive thinking +
+  `output_config.effort` on Claude 4.6 and later, a `budget_tokens` on older Claude models (Haiku
+  4.5), `reasoning_effort` on OpenAI and xAI, and `thinking_config.thinking_level` on Gemini. With
+  `reasoning` set, the sampling parameters reasoning models refuse are dropped instead of sent to a
+  guaranteed 400 (`temperature`/`top_p`/`top_k` on Anthropic, `temperature`/`top_p`/`stop` on
+  OpenAI, `stop` on xAI), and the default output cap rises, since thinking counts against it: from
+  1,024 to 16,000 tokens on OpenAI and Claude 4.6+, and to the thinking budget plus 1,024 on older
+  Claude models. A forced `tool_choice` applies to the tool loop's
+  first turn only. An unknown `reasoning` level, or a `tool_choice` naming a tool the request does
+  not define, raises `ConfigError`.
+- **The same generic keys on a tier** (`temperature`, `top_p`, `top_k`, `seed`, `reasoning`, next
+  to `max_tokens`), as that model's defaults; a request that sets the same key wins. Precedence,
+  lowest to highest: tier generic keys, request generic fields, tier `options`, request
+  `provider_options`.
+- **Provider-scoped `provider_options`.** `{"anthropic": {...}, "gemini": {...}}`: each provider
+  reads only its own entry, so one request can carry raw options for every tier it might be routed
+  to — and this works on all four providers. The unscoped form keeps its old behaviour (applied on
+  Anthropic and OpenAI, ignored on Gemini and xAI). `classify_and_answer`'s guidance also reaches a
+  scoped `provider_options["anthropic"]["system"]`.
+
+### Changed
+
+- **The `grok` provider is now `xai`.** Providers are named for the API vendor, like `anthropic`
+  and `openai`; Grok is xAI's model family, and the SDK (`xai-sdk`) and key (`XAI_API_KEY`) were
+  already named for xAI. Model specs become `xai:grok-4.3`, the config table
+  `[maslul.providers.xai]`, the extra `maslul[xai]`, and the driver
+  `maslul.providers.xai.XAIProvider`. Model ids are unchanged.
+- **Tier `options` now reach Gemini and xAI.** `[maslul.tiers.*] options` (and
+  `[maslul.classifier] options`) were applied only by Anthropic and OpenAI; Gemini now merges them
+  into `GenerateContentConfig` (`thinking_config`, `candidate_count`, …) and xAI into
+  `chat.create()` (`reasoning_effort`, `parallel_tool_calls`, …).
+- **The response cache keys on the generic parameters.** Two requests that differ only in
+  `temperature`, `top_p`, `top_k`, `seed`, `stop` or `reasoning` no longer share a cached answer.
+  Requests that set none of them keep the key they had.
+- **Gemini's explicit cache skips a request with a forced `tool_choice`.** Vertex refuses
+  `tool_config` next to `cached_content`, and a forced choice changes every turn, so the request
+  goes out uncached rather than minting a `CachedContent` per turn.
+
+### Fixed
+
+- **The `model = "provider:model"` tier shorthand dropped `max_tokens` and `options`.** Only the
+  split `provider` + `model` form read them, so a shorthand tier silently ignored both. Both forms
+  now accept them.
+- **`Request.stop` was ignored on xAI.** It is now sent as `chat.create(stop=...)`, like the other
+  three providers.
+
+### Deprecated
+
+- **`grok` as a provider name.** It still works everywhere it used to (a `provider:model` spec, a
+  tier's `provider` key, a `[maslul.providers.grok]` table, a `Router(providers={"grok": ...})`
+  key, `build_provider("grok", ...)`, the `maslul[grok]` extra and `maslul.providers.grok`), is
+  mapped to `xai`, and emits a `DeprecationWarning`. It will be removed in a future release.
+
+### Docs
+
+- README: drop the stale *Status* section (it still said `0.2.x` and three providers) in favour
+  of PyPI, Python-version, CI and license badges; document all four routing hooks
+  (`bypass_predicate`, `hard_signal`, `classifier`, `verifier`); list the `openai` and `jev`
+  extras; add a *Model parameters* section (the generic-to-provider mapping table, raw options,
+  precedence, and the model-specific refusals to know about); the Gemini config example moves off
+  the access-limited 2.5 line.
+
 ## [0.5.0] - 2026-10-01
 
 ### Added
@@ -272,6 +342,13 @@ Initial release — an async, fully-typed LLM router across Anthropic, Gemini, a
 - Config from TOML or a plain dict (`Router.from_toml` / `Router(config=...)`), with the
   `provider:model` shorthand and env-var-referenced secrets.
 
-[Unreleased]: https://github.com/iliatankelevich/maslul/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/iliatankelevich/maslul/compare/v0.6.0...HEAD
+[0.6.0]: https://github.com/iliatankelevich/maslul/compare/v0.5.0...v0.6.0
+[0.5.0]: https://github.com/iliatankelevich/maslul/compare/v0.4.0...v0.5.0
+[0.4.0]: https://github.com/iliatankelevich/maslul/compare/v0.3.2...v0.4.0
+[0.3.2]: https://github.com/iliatankelevich/maslul/compare/v0.3.1...v0.3.2
+[0.3.1]: https://github.com/iliatankelevich/maslul/compare/v0.3.0...v0.3.1
+[0.3.0]: https://github.com/iliatankelevich/maslul/compare/v0.2.1...v0.3.0
+[0.2.1]: https://github.com/iliatankelevich/maslul/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/iliatankelevich/maslul/releases/tag/v0.2.0
 [0.1.0]: https://github.com/iliatankelevich/maslul/releases/tag/v0.1.0

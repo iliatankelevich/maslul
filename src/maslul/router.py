@@ -55,6 +55,7 @@ from maslul.types import (
     ToolCall,
     Usage,
     Verifier,
+    canonical_provider,
 )
 
 # Guard against a runaway tool loop.
@@ -126,7 +127,9 @@ class Router:
         )
         if providers is None:
             providers = self._auto_build(missing_provider == "degrade")
-        self._providers: dict[str, Provider] = dict(providers)
+        self._providers: dict[str, Provider] = {
+            canonical_provider(name): p for name, p in providers.items()
+        }
         if missing_provider == "degrade":
             self._degrade_to_available()
         self._cache = ResponseCache(self._config.cache, embed)
@@ -460,7 +463,8 @@ class Router:
     ) -> Response:
         """Drive the provider-agnostic tool loop. ``seed`` is an already-fetched first response
         (e.g. CLASSIFY_AND_ANSWER's answer turn) — used as turn 1 instead of making a fresh call."""
-        assert req.tool_executor is not None
+        executor = req.tool_executor
+        assert executor is not None
         messages = list(req.messages)
         executed: list[ToolCall] = []
         resp = seed
@@ -476,10 +480,14 @@ class Router:
             )
             for call in resp.tool_calls:
                 executed.append(call)
-                result = await req.tool_executor(call)
+                result = await executor(call)
                 messages.append(
                     Message(role="tool", content=result, tool_call_id=call.id, name=call.name)
                 )
+            if req.tool_choice not in (None, "auto", "none"):
+                # A forced choice ("required" or a tool name) is for the first turn only: kept, it
+                # would force another call every turn and the model could never answer.
+                req = replace(req, tool_choice=None)
             resp = None
         raise ProviderError(f"tool loop exceeded {_MAX_TOOL_ITERATIONS} iterations")
 
@@ -545,10 +553,26 @@ def _cache_key(req: Request, model: str | ModelSpec | None, level: Level | None)
         json.dumps(req.response_format, sort_keys=True) if req.response_format else "",
         f"web_search={req.web_search}",
         f"media={len(req.media or [])}",
+        _params_key(req),
         f"model={model}",
         f"level={level}",
     ]
     return " ".join(p for p in parts if p)
+
+
+def _params_key(req: Request) -> str:
+    """The generic generation parameters that change the answer, when any are set (empty
+    otherwise, so a plain request keeps the key it always had)."""
+    params = {
+        "temperature": req.temperature,
+        "top_p": req.top_p,
+        "top_k": req.top_k,
+        "seed": req.seed,
+        "stop": req.stop,
+        "reasoning": req.reasoning,
+    }
+    set_params = {k: v for k, v in params.items() if v is not None}
+    return f"params={json.dumps(set_params, sort_keys=True)}" if set_params else ""
 
 
 def _approx_tokens(text: str) -> int:
@@ -580,23 +604,32 @@ def _parse_escalation(text: str) -> Level | None:
 
 def _with_guidance(req: Request, guidance: str) -> Request:
     """Prepend a system instruction so it reaches the model *regardless of how the system prompt is
-    delivered*. It always goes into ``req.system`` (which Gemini/Grok/OpenAI read). When a caller
-    pins the system via ``provider_options["system"]`` — Anthropic's prompt-caching pattern, where
-    that value *overrides* ``req.system`` — the guidance is prepended there too, or it would be
-    silently dropped (this broke ``classify_and_answer`` self-escalation for cached Anthropic
-    callers). The original system value is preserved; only a constant prefix is added."""
+    delivered*. It always goes into ``req.system`` (which Gemini/xAI/OpenAI read). When a caller
+    pins the system via ``provider_options["system"]`` (or the scoped ``["anthropic"]["system"]``)
+    — Anthropic's prompt-caching pattern, where that value *overrides* ``req.system`` — the
+    guidance is prepended there too, or it would be silently dropped (this broke
+    ``classify_and_answer`` self-escalation for cached Anthropic callers). The original system
+    value is preserved; only a constant prefix is added."""
     system = [guidance, *(req.system or [])]
-    pinned = req.provider_options.get("system")
-    if pinned is None:
-        return replace(req, system=system)
-    options = dict(req.provider_options)
+    options = _pin_guidance(req.provider_options, guidance)
+    scoped = req.provider_options.get("anthropic")
+    if isinstance(scoped, Mapping):  # the scoped form: {"anthropic": {"system": ...}}
+        options["anthropic"] = _pin_guidance(scoped, guidance)
+    return replace(req, system=system, provider_options=options)
+
+
+def _pin_guidance(options: Mapping[str, Any], guidance: str) -> dict[str, Any]:
+    """A copy of ``options`` with ``guidance`` prepended to its pinned ``system``, if it has one.
+    Any shape other than a string or a list of content blocks is left alone; ``req.system`` still
+    carries the guidance."""
+    out = dict(options)
+    pinned = out.get("system")
     if isinstance(pinned, str):
-        options["system"] = f"{guidance}\n\n{pinned}"
+        out["system"] = f"{guidance}\n\n{pinned}"
     elif isinstance(pinned, list):
         # Anthropic structured system: a list of content blocks (often cache_control-marked).
-        options["system"] = [{"type": "text", "text": guidance}, *pinned]
-    # Any other shape: leave provider_options untouched; req.system still carries the guidance.
-    return replace(req, system=system, provider_options=options)
+        out["system"] = [{"type": "text", "text": guidance}, *pinned]
+    return out
 
 
 def _record(ledger: dict[tuple[str, str], Usage], resp: Response) -> None:

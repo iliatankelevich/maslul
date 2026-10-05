@@ -22,7 +22,7 @@ requires_gemini = pytest.mark.skipif(
     not (os.getenv("MASLUL_VERTEX_PROJECT") or os.getenv("GOOGLE_CLOUD_PROJECT")),
     reason="no Vertex project configured (set MASLUL_VERTEX_PROJECT)",
 )
-requires_grok = pytest.mark.skipif(not os.getenv("XAI_API_KEY"), reason="XAI_API_KEY not set")
+requires_xai = pytest.mark.skipif(not os.getenv("XAI_API_KEY"), reason="XAI_API_KEY not set")
 requires_openai = pytest.mark.skipif(
     not os.getenv("OPENAI_API_KEY"), reason="OPENAI_API_KEY not set"
 )
@@ -67,12 +67,12 @@ async def test_gemini_live() -> None:
     await provider.healthcheck(spec)
 
 
-@requires_grok
-async def test_grok_live() -> None:
-    from maslul.providers.grok import GrokProvider
+@requires_xai
+async def test_xai_live() -> None:
+    from maslul.providers.xai import XAIProvider
 
-    provider = GrokProvider()
-    spec = ModelSpec(provider="grok", model=os.getenv("MASLUL_GROK_MODEL", "grok-4.3"))
+    provider = XAIProvider()
+    spec = ModelSpec(provider="xai", model=os.getenv("MASLUL_XAI_MODEL", "grok-4.3"))
     resp = await provider.complete(spec, _prompt())
     assert resp.text.strip()
     assert resp.usage.output_tokens > 0
@@ -135,13 +135,13 @@ async def test_anthropic_tool_loop_live() -> None:
     await _calculator_round_trip("anthropic", AnthropicProvider(), model)
 
 
-@requires_grok
-async def test_grok_tool_loop_live() -> None:
+@requires_xai
+async def test_xai_tool_loop_live() -> None:
     # Exercises the stateless reconstruction of the assistant tool-call turn (the M2 risk).
-    from maslul.providers.grok import GrokProvider
+    from maslul.providers.xai import XAIProvider
 
-    model = os.getenv("MASLUL_GROK_MODEL", "grok-4.3")
-    await _calculator_round_trip("grok", GrokProvider(), model)
+    model = os.getenv("MASLUL_XAI_MODEL", "grok-4.3")
+    await _calculator_round_trip("xai", XAIProvider(), model)
 
 
 _MUL_TOOL = ToolDef(
@@ -296,24 +296,24 @@ async def test_gemini_vision_live() -> None:
     )
 
 
-@requires_grok
-async def test_grok_structured_live() -> None:
-    from maslul.providers.grok import GrokProvider
+@requires_xai
+async def test_xai_structured_live() -> None:
+    from maslul.providers.xai import XAIProvider
 
-    await _structured_round_trip("grok", GrokProvider(), os.getenv("MASLUL_GROK_MODEL", "grok-4.3"))
+    await _structured_round_trip("xai", XAIProvider(), os.getenv("MASLUL_XAI_MODEL", "grok-4.3"))
 
 
-@requires_grok
-async def test_grok_vision_live() -> None:
-    from maslul.providers.grok import GrokProvider
+@requires_xai
+async def test_xai_vision_live() -> None:
+    from maslul.providers.xai import XAIProvider
 
-    await _vision_round_trip("grok", GrokProvider(), os.getenv("MASLUL_GROK_MODEL", "grok-4.3"))
+    await _vision_round_trip("xai", XAIProvider(), os.getenv("MASLUL_XAI_MODEL", "grok-4.3"))
 
 
 # --- web search parity (live, per provider) ----------------------------------------------
 # The whole point of the normalized flag: one `web_search=True` grounds the answer on EVERY
-# provider (Anthropic web_search tool / Gemini Google Search / Grok Live Search), citations in
-# Response.sources — so the caller never picks a provider-specific mechanism.
+# provider (Anthropic web_search tool / Gemini Google Search / xAI Agent Tools web_search),
+# citations in Response.sources — so the caller never picks a provider-specific mechanism.
 
 
 async def _web_search_round_trip(provider_name: str, provider: Any, model: str) -> None:
@@ -341,11 +341,11 @@ async def test_gemini_web_search_live() -> None:
     )
 
 
-@requires_grok
-async def test_grok_web_search_live() -> None:
-    from maslul.providers.grok import GrokProvider
+@requires_xai
+async def test_xai_web_search_live() -> None:
+    from maslul.providers.xai import XAIProvider
 
-    await _web_search_round_trip("grok", GrokProvider(), os.getenv("MASLUL_GROK_MODEL", "grok-4.3"))
+    await _web_search_round_trip("xai", XAIProvider(), os.getenv("MASLUL_XAI_MODEL", "grok-4.3"))
 
 
 # --- OpenAI (live) — the full provider surface in one place ------------------------------

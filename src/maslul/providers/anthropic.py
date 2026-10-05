@@ -21,13 +21,20 @@ Importing this module requires the ``anthropic`` extra (``pip install maslul[ant
 from __future__ import annotations
 
 import base64
+import re
 from typing import Any
 
 import anthropic
 from anthropic import AsyncAnthropic
 
 from maslul.errors import AuthError, ProviderError, RateLimited, Timeout
-from maslul.providers._common import media_first, media_index
+from maslul.providers._common import (
+    GenerationParams,
+    generation_params,
+    media_first,
+    media_index,
+    raw_options,
+)
 from maslul.types import (
     ContextCache,
     MediaPart,
@@ -40,6 +47,14 @@ from maslul.types import (
 )
 
 _DEFAULT_MAX_TOKENS = 1024
+# With thinking on, thinking tokens count against max_tokens, so 1024 would truncate most answers.
+_DEFAULT_REASONING_MAX_TOKENS = 16000
+# Thinking budgets for models that predate adaptive thinking (Haiku 4.5 and older). The API's
+# minimum is 1024, and the budget must stay below max_tokens.
+_THINKING_BUDGET = {"low": 1024, "medium": 4096, "high": 8192}
+# The model generation, e.g. "claude-haiku-4-5" -> (4, 5). A trailing date ("-20250514") is not a
+# minor version, hence the one-or-two-digit limit and the lookahead.
+_CLAUDE_VERSION = re.compile(r"claude-[a-z]+-(\d+)(?:-(\d{1,2}))?(?=$|[-@])")
 # Guard against a runaway server-side-tool (web search) resume loop.
 _MAX_SERVER_TOOL_TURNS = 10
 # Anthropic's server-side web search tool type (versioned).
@@ -48,6 +63,54 @@ _WEB_SEARCH_TOOL = "web_search_20250305"
 _MAX_BREAKPOINTS = 4
 # ``ttl_seconds`` at or above this opts into the 1-hour cache (2x write premium vs 1.25x).
 _LONG_TTL_SECONDS = 3600
+
+
+def _apply_sampling(kwargs: dict[str, Any], model: str, params: GenerationParams) -> None:
+    """``max_tokens``, the sampling parameters, and ``reasoning`` → thinking.
+
+    Thinking rules out the sampling parameters (``temperature`` must stay at 1, ``top_k`` is
+    refused, ``top_p`` is narrowed), so with ``reasoning`` set they are dropped rather than sent to
+    a guaranteed 400. Claude 4.6 and later take adaptive thinking with ``output_config.effort``;
+    older models (Haiku 4.5 among them) take a fixed ``budget_tokens``. ``seed`` has no Anthropic
+    equivalent and is ignored.
+    """
+    max_tokens = params.max_tokens
+    if params.reasoning is None:
+        for key in ("temperature", "top_p", "top_k"):
+            value = getattr(params, key)
+            if value is not None:
+                kwargs[key] = value
+        kwargs["max_tokens"] = max_tokens or _DEFAULT_MAX_TOKENS
+    elif _uses_thinking_budget(model):
+        budget = _THINKING_BUDGET[params.reasoning]
+        kwargs["thinking"] = {"type": "enabled", "budget_tokens": budget}
+        # budget_tokens must be below max_tokens; leave the answer its default room on top.
+        kwargs["max_tokens"] = max(max_tokens or 0, budget + _DEFAULT_MAX_TOKENS)
+    else:
+        kwargs["thinking"] = {"type": "adaptive"}
+        kwargs["output_config"] = {"effort": params.reasoning}
+        kwargs["max_tokens"] = max_tokens or _DEFAULT_REASONING_MAX_TOKENS
+
+
+def _uses_thinking_budget(model: str) -> bool:
+    """True for Claude models that predate adaptive thinking (before 4.6, e.g. Haiku 4.5). An id
+    this can't read is assumed to be current."""
+    if re.search(r"claude-\d", model):  # legacy naming: claude-3-7-sonnet-...
+        return True
+    m = _CLAUDE_VERSION.search(model)
+    if m is None:
+        return False
+    return (int(m[1]), int(m[2] or 0)) < (4, 6)
+
+
+def _tool_choice(choice: str) -> dict[str, Any]:
+    """Generic tool choice → Anthropic's. Forced choices (``required``, a tool name) are refused
+    by some current models (Opus 5.5, Sonnet 5.5) and while thinking is on."""
+    if choice == "required":
+        return {"type": "any"}
+    if choice in ("auto", "none"):
+        return {"type": choice}
+    return {"type": "tool", "name": choice}
 
 
 def _has_web_search(server_tools: list[dict[str, Any]] | None) -> bool:
@@ -68,10 +131,8 @@ class AnthropicProvider:
         )
 
     async def complete(self, spec: ModelSpec, req: Request) -> Response:
-        kwargs: dict[str, Any] = {
-            "model": spec.model,
-            "max_tokens": req.max_tokens or spec.max_tokens or _DEFAULT_MAX_TOKENS,
-        }
+        params = generation_params(spec, req)
+        kwargs: dict[str, Any] = {"model": spec.model}
         # Client tools (router-executed) + raw server-side tools (web search, run by Anthropic).
         tools = [
             {"name": t.name, "description": t.description, "input_schema": t.input_schema}
@@ -87,6 +148,8 @@ class AnthropicProvider:
             tools.append(web)
         if tools:
             kwargs["tools"] = tools
+        if req.tools and params.tool_choice is not None:
+            kwargs["tool_choice"] = _tool_choice(params.tool_choice)
         cache = req.context_cache
         # Prompt caching. Anthropic is the only provider that requires explicit markers; the render
         # order is tools → system → messages, and a breakpoint caches *everything before it*.
@@ -100,14 +163,13 @@ class AnthropicProvider:
                 kwargs["system"] = system_blocks
             else:
                 kwargs["system"] = "\n\n".join(req.system)
-        if req.temperature is not None:
-            kwargs["temperature"] = req.temperature
-        if req.stop:
-            kwargs["stop_sequences"] = req.stop
+        _apply_sampling(kwargs, spec.model, params)
+        if params.stop:
+            kwargs["stop_sequences"] = params.stop
         kwargs.update(spec.options)
-        kwargs.update(req.provider_options)
+        kwargs.update(raw_options(self.name, req.provider_options, unscoped=True))
         if req.response_format is not None:
-            # merge into output_config so it coexists with effort/thinking from provider_options
+            # merge into output_config so it coexists with an effort (reasoning, provider_options)
             output_config = dict(kwargs.get("output_config") or {})
             output_config["format"] = {"type": "json_schema", "schema": req.response_format}
             kwargs["output_config"] = output_config
