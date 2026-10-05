@@ -16,7 +16,7 @@ from typing import Any
 
 from maslul.errors import ConfigError
 from maslul.providers.base import Provider
-from maslul.types import KNOWN_PROVIDERS
+from maslul.types import KNOWN_PROVIDERS, canonical_provider
 
 __all__ = ["Provider", "build_provider"]
 
@@ -30,6 +30,7 @@ def build_provider(name: str, config: Mapping[str, Any]) -> Provider:
     The per-branch imports are deliberately deferred (see this module's docstring): they pull in
     the SDK only for the provider you actually build, keeping ``import maslul`` SDK-free.
     """
+    name = canonical_provider(name)
     if name == "anthropic":
         from maslul.providers.anthropic import AnthropicProvider
 
@@ -49,13 +50,13 @@ def build_provider(name: str, config: Mapping[str, Any]) -> Provider:
             vertex_location=config.get("vertex_location", "global"),
             api_key=key,
         )
-    if name == "grok":
-        from maslul.providers.grok import GrokProvider
+    if name == "xai":
+        from maslul.providers.xai import XAIProvider
 
         key = _env(config.get("api_key_env")) or os.environ.get("XAI_API_KEY")
         if not key:
-            raise ConfigError("grok not configured (set api_key_env or XAI_API_KEY)")
-        return GrokProvider(api_key=key)
+            raise ConfigError("xai not configured (set api_key_env or XAI_API_KEY)")
+        return XAIProvider(api_key=key)
     if name == "openai":
         from maslul.providers.openai import OpenAIProvider
 

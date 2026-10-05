@@ -700,7 +700,7 @@ wheels = [
 
 [[package]]
 name = "maslul"
-version = "0.5.0"
+version = "0.6.0"
 source = { editable = "." }
 
 [package.optional-dependencies]
@@ -719,6 +719,9 @@ jev = [
 openai = [
     { name = "openai" },
 ]
+xai = [
+    { name = "xai-sdk" },
+]
 
 [package.dev-dependencies]
 dev = [
@@ -735,8 +738,9 @@ requires-dist = [
     { name = "httpx", marker = "extra == 'jev'", specifier = ">=0.27" },
     { name = "openai", marker = "extra == 'openai'", specifier = ">=1.0.0" },
     { name = "xai-sdk", marker = "extra == 'grok'", specifier = ">=1.0.0" },
+    { name = "xai-sdk", marker = "extra == 'xai'", specifier = ">=1.0.0" },
 ]
-provides-extras = ["anthropic", "gemini", "grok", "jev", "openai"]
+provides-extras = ["anthropic", "gemini", "xai", "jev", "openai", "grok"]
 
 [package.metadata.requires-dev]
 dev = [

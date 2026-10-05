@@ -6,13 +6,13 @@ from __future__ import annotations
 
 import os
 import tomllib
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from typing import Any
 
 from maslul.cache import CacheConfig
 from maslul.errors import ConfigError
-from maslul.types import Level, ModelSpec, Strategy
+from maslul.types import REASONING_LEVELS, Level, ModelSpec, Strategy, canonical_provider
 
 
 @dataclass
@@ -68,7 +68,9 @@ class RouterConfig:
             tiers=tiers,
             classifier=classifier,
             min_tokens_to_classify=min_tokens,
-            providers=dict(root.get("providers", {})),
+            providers={
+                canonical_provider(name): entry for name, entry in root.get("providers", {}).items()
+            },
             request_timeout=float(timeout) if timeout is not None else None,
             max_retries=int(root.get("max_retries", 2)),
             retry_base_delay=float(root.get("retry_base_delay", 0.5)),
@@ -106,18 +108,38 @@ def _parse_level(value: str | Level) -> Level:
 
 def _model_spec(entry: Mapping[str, Any]) -> ModelSpec:
     """A tier/classifier entry: either split ``provider``+``model`` keys, or a single
-    ``model = "provider:model"`` shorthand.
+    ``model = "provider:model"`` shorthand. Both forms take the optional generic parameters
+    (``max_tokens``, ``temperature``, ``top_p``, ``top_k``, ``seed``, ``reasoning``), translated
+    per provider, and ``options``: raw SDK parameters for this model, which override them.
     """
     if "provider" in entry:
-        return ModelSpec(
-            provider=entry["provider"],
-            model=entry["model"],
-            max_tokens=entry.get("max_tokens"),
-            options=dict(entry.get("options", {})),
+        provider, model = entry["provider"], entry["model"]
+    elif "model" in entry:
+        parsed = ModelSpec.parse(entry["model"])
+        provider, model = parsed.provider, parsed.model
+    else:
+        raise ConfigError(
+            f"tier/classifier needs 'provider'+'model' or a 'provider:model' shorthand, "
+            f"got {dict(entry)!r}"
         )
-    if "model" in entry:
-        return ModelSpec.parse(entry["model"])
-    raise ConfigError(
-        f"tier/classifier needs 'provider'+'model' or a 'provider:model' shorthand, "
-        f"got {dict(entry)!r}"
+    reasoning = entry.get("reasoning")
+    if reasoning is not None and reasoning not in REASONING_LEVELS:
+        raise ConfigError(
+            f"unknown reasoning level {reasoning!r} — expected one of {sorted(REASONING_LEVELS)}"
+        )
+    return ModelSpec(
+        provider=provider,
+        model=model,
+        max_tokens=entry.get("max_tokens"),
+        options=dict(entry.get("options", {})),
+        temperature=_optional(entry, "temperature", float),
+        top_p=_optional(entry, "top_p", float),
+        top_k=_optional(entry, "top_k", int),
+        seed=_optional(entry, "seed", int),
+        reasoning=reasoning,
     )
+
+
+def _optional[T](entry: Mapping[str, Any], key: str, kind: Callable[[Any], T]) -> T | None:
+    value = entry.get(key)
+    return None if value is None else kind(value)

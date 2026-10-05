@@ -16,8 +16,8 @@ from maslul.errors import ConfigError
 from maslul.providers import build_provider
 from maslul.providers.anthropic import AnthropicProvider
 from maslul.providers.gemini import GeminiProvider
-from maslul.providers.grok import GrokProvider
 from maslul.providers.openai import OpenAIProvider
+from maslul.providers.xai import XAIProvider
 from maslul.types import (
     ContextCache,
     MediaPart,
@@ -112,10 +112,27 @@ async def test_gemini_normalizes_text_usage_and_finish_reason() -> None:
     assert out.finish_reason == "STOP"
 
 
-# --- Grok --------------------------------------------------------------------------------
+async def test_gemini_applies_tier_options_but_not_request_provider_options() -> None:
+    resp = SimpleNamespace(text="ok", usage_metadata=None, candidates=[])
+    fake = _FakeGemini(resp)
+    spec = ModelSpec(
+        provider="gemini", model="gemini-2.5-flash", options={"top_p": 0.5, "temperature": 0.9}
+    )
+    req = Request(
+        messages=[Message(role="user", content="hello")],
+        temperature=0.1,
+        provider_options={"system": [{"type": "text", "text": "anthropic-shaped"}]},
+    )
+    await GeminiProvider(client=fake).complete(spec, req)
+    config = fake.calls[0]["config"]
+    assert config.top_p == 0.5
+    assert config.temperature == 0.9  # tier options override the normalized request field
 
 
-class _FakeGrokChat:
+# --- xAI --------------------------------------------------------------------------------
+
+
+class _FakeXAIChat:
     def __init__(self, resp: Any) -> None:
         self._resp = resp
 
@@ -123,32 +140,50 @@ class _FakeGrokChat:
         return self._resp
 
 
-class _FakeGrok:
+class _FakeXAI:
     def __init__(self, resp: Any) -> None:
         self.calls: list[dict[str, Any]] = []
         self.chat = SimpleNamespace(create=self._create)
         self._resp = resp
 
-    def _create(self, **kwargs: Any) -> _FakeGrokChat:
+    def _create(self, **kwargs: Any) -> _FakeXAIChat:
         self.calls.append(kwargs)
-        return _FakeGrokChat(self._resp)
+        return _FakeXAIChat(self._resp)
 
 
-async def test_grok_normalizes_text_usage_and_finish_reason() -> None:
+async def test_xai_normalizes_text_usage_and_finish_reason() -> None:
     resp = SimpleNamespace(
         content="hi from grok",
         usage=SimpleNamespace(prompt_tokens=4, completion_tokens=2, cached_prompt_text_tokens=0),
         finish_reason="stop",
     )
-    fake = _FakeGrok(resp)
-    out = await GrokProvider(client=fake).complete(
-        ModelSpec(provider="grok", model="grok-4.3"), _req()
+    fake = _FakeXAI(resp)
+    out = await XAIProvider(client=fake).complete(
+        ModelSpec(provider="xai", model="grok-4.3"), _req()
     )
     assert out.text == "hi from grok"
-    assert out.provider == "grok"
+    assert out.provider == "xai"
     assert (out.usage.input_tokens, out.usage.output_tokens) == (4, 2)
     assert out.finish_reason == "stop"
     assert fake.calls[0]["model"] == "grok-4.3"
+
+
+async def test_xai_passes_stop_and_tier_options() -> None:
+    resp = SimpleNamespace(content="ok", usage=None, finish_reason=None)
+    fake = _FakeXAI(resp)
+    spec = ModelSpec(
+        provider="xai", model="grok-4.3", options={"top_p": 0.5, "reasoning_effort": "low"}
+    )
+    req = Request(
+        messages=[Message(role="user", content="hello")],
+        stop=["END"],
+        provider_options={"system": "anthropic-shaped"},
+    )
+    await XAIProvider(client=fake).complete(spec, req)
+    call = fake.calls[0]
+    assert call["stop"] == ["END"]
+    assert (call["top_p"], call["reasoning_effort"]) == (0.5, "low")
+    assert "system" not in call  # request-level provider_options are not applied on xAI
 
 
 # --- build_provider factory --------------------------------------------------------------
@@ -160,8 +195,26 @@ async def test_build_provider_dispatches_by_name(monkeypatch: pytest.MonkeyPatch
     cfg = {"api_key_env": "MASLUL_DUMMY_KEY"}
     assert isinstance(build_provider("anthropic", cfg), AnthropicProvider)
     assert isinstance(build_provider("gemini", cfg), GeminiProvider)
-    assert isinstance(build_provider("grok", cfg), GrokProvider)
+    assert isinstance(build_provider("xai", cfg), XAIProvider)
     assert isinstance(build_provider("openai", cfg), OpenAIProvider)
+
+
+async def test_build_provider_accepts_deprecated_grok(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("MASLUL_DUMMY_KEY", "dummy")
+    with pytest.warns(DeprecationWarning, match="'grok' is deprecated"):
+        provider = build_provider("grok", {"api_key_env": "MASLUL_DUMMY_KEY"})
+    assert isinstance(provider, XAIProvider)
+    assert provider.name == "xai"
+
+
+def test_grok_module_is_a_deprecated_alias() -> None:
+    import importlib
+    import sys
+
+    sys.modules.pop("maslul.providers.grok", None)
+    with pytest.warns(DeprecationWarning, match="maslul.providers.grok is deprecated"):
+        grok = importlib.import_module("maslul.providers.grok")
+    assert grok.GrokProvider is XAIProvider
 
 
 def test_build_provider_unknown_raises() -> None:
@@ -330,7 +383,7 @@ async def test_gemini_parallel_tool_results_collapse_into_one_turn() -> None:
     assert [p.function_response.name for p in contents[2].parts] == ["add", "mul"]
 
 
-async def test_grok_tool_use_translation() -> None:
+async def test_xai_tool_use_translation() -> None:
     resp = SimpleNamespace(
         content="",
         tool_calls=[
@@ -341,9 +394,9 @@ async def test_grok_tool_use_translation() -> None:
         usage=SimpleNamespace(prompt_tokens=1, completion_tokens=1, cached_prompt_text_tokens=0),
         finish_reason="tool_calls",
     )
-    fake = _FakeGrok(resp)
-    provider = GrokProvider(client=fake)
-    spec = ModelSpec(provider="grok", model="grok-4.3")
+    fake = _FakeXAI(resp)
+    provider = XAIProvider(client=fake)
+    spec = ModelSpec(provider="xai", model="grok-4.3")
 
     out = await provider.complete(
         spec, Request(messages=[Message(role="user", content="2+3?")], tools=[_TOOL])
@@ -476,16 +529,16 @@ async def test_gemini_structured_and_media_translation() -> None:
     assert any(getattr(p, "inline_data", None) is not None for p in parts)
 
 
-async def test_grok_structured_and_media_translation() -> None:
+async def test_xai_structured_and_media_translation() -> None:
     resp = SimpleNamespace(
         content='{"ok": true}',
         tool_calls=[],
         usage=SimpleNamespace(prompt_tokens=1, completion_tokens=1, cached_prompt_text_tokens=0),
         finish_reason="stop",
     )
-    fake = _FakeGrok(resp)
-    await GrokProvider(client=fake).complete(
-        ModelSpec(provider="grok", model="grok-4.3"), _vision_req()
+    fake = _FakeXAI(resp)
+    await XAIProvider(client=fake).complete(
+        ModelSpec(provider="xai", model="grok-4.3"), _vision_req()
     )
     kwargs = fake.calls[0]
     rf = kwargs["response_format"]
@@ -572,7 +625,7 @@ async def test_gemini_web_search_adds_google_search_and_maps_sources() -> None:
     assert out.sources == ["https://ex.com/a"]
 
 
-async def test_grok_web_search_adds_server_tool_and_maps_citations() -> None:
+async def test_xai_web_search_adds_server_tool_and_maps_citations() -> None:
     resp = SimpleNamespace(
         content="grounded",
         tool_calls=[],
@@ -580,9 +633,9 @@ async def test_grok_web_search_adds_server_tool_and_maps_citations() -> None:
         finish_reason="stop",
         citations=["https://ex.com/b", "https://ex.com/b"],  # de-duped
     )
-    fake = _FakeGrok(resp)
-    out = await GrokProvider(client=fake).complete(
-        ModelSpec(provider="grok", model="grok-4.3"),
+    fake = _FakeXAI(resp)
+    out = await XAIProvider(client=fake).complete(
+        ModelSpec(provider="xai", model="grok-4.3"),
         Request(messages=[Message(role="user", content="news?")], web_search=True),
     )
     # xAI Agent Tools API: web_search is a server-side Tool entry (not the deprecated SearchParams).

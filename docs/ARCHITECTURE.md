@@ -6,7 +6,7 @@ maslul does exactly two things, and nothing else:
 
 1. **Routing** — decide which model *tier* (or exact model) handles each request.
 2. **Provider normalization** — present one `Request`/`Response` shape over the Anthropic,
-   Google Gemini, and xAI Grok SDKs, so callers write the loop once.
+   Google Gemini, xAI, and OpenAI SDKs, so callers write the loop once.
 
 Everything below serves those two jobs. There is no server, no CLI, and no agent framework.
 
@@ -28,7 +28,7 @@ src/maslul/
    ├─ _common.py      tiny shared helpers (no SDK)
    ├─ anthropic.py    AnthropicProvider   (extra: anthropic)
    ├─ gemini.py       GeminiProvider      (extra: gemini)
-   ├─ grok.py         GrokProvider        (extra: grok)
+   ├─ xai.py          XAIProvider         (extra: xai)
    └─ openai.py       OpenAIProvider      (extra: openai)
 ```
 
@@ -60,16 +60,27 @@ Every provider speaks the same `Request` → `Response`:
 
 ```python
 Request(messages, system, tools, tool_executor, response_format, media, server_tools,
-        web_search, web_search_max_uses, max_tokens, temperature, stop, provider_options, metadata)
+        web_search, web_search_max_uses, context_cache, max_tokens, temperature, top_p, top_k,
+        seed, stop, reasoning, tool_choice, provider_options, metadata)
 
 Response(text, level_used, provider, model, usage, structured, tool_calls, finish_reason,
          sources, classification_usage, usage_records, raw)
 ```
 
+The generation parameters (`max_tokens` through `tool_choice`) are generic: each provider
+translates them into its own SDK keywords (`providers/_common.generation_params` resolves them over
+the tier's defaults first), ignores the ones it has no equivalent for, and drops the sampling
+parameters reasoning models refuse when `reasoning` is set. The README's *Model parameters* table
+is the full mapping.
+
 Two escape hatches keep the abstraction from ever boxing you in:
 
-- **`provider_options`** — a raw passthrough merged into the underlying SDK call. Anything maslul
-  doesn't model first-class (Anthropic prompt caching / `thinking` / `effort`, etc.) goes here.
+- **`provider_options`** — raw SDK keywords merged last into the call. Scoped by provider
+  (`{"anthropic": {...}, "gemini": {...}}`), each provider reads only its own entry, so one request
+  can carry raw options for every tier the router might pick. The legacy unscoped form still
+  reaches Anthropic and OpenAI and is ignored by Gemini and xAI, because callers put
+  Anthropic-shaped values in it (a content-block `system`). A tier's `options` table
+  (`ModelSpec.options`) is the per-model equivalent.
 - **`Response.raw`** — the untouched SDK response object.
 
 `Difficulty is not readable from surface features.` A short prompt can be very hard and a long
@@ -137,7 +148,7 @@ class Provider(Protocol):
     the raw assistant content (which the normalized loop deliberately doesn't carry) and accumulating
     usage across resumes.
   - `gemini` → a `google_search` grounding `Tool`; sources from the grounding metadata.
-  - `grok` → the xAI Agent Tools `web_search` tool; sources from the response citations.
+  - `xai` → the xAI Agent Tools `web_search` tool; sources from the response citations.
   The raw `Request.server_tools` passthrough remains for advanced Anthropic-specific specs.
 
 The two compose: a single `provider.complete` call resolves any web searches internally, then
@@ -154,7 +165,7 @@ on them.
 |---|---|---|---|
 | `anthropic` | `anthropic` | `ANTHROPIC_API_KEY` | `web_search` server tool (pause/resume), prompt caching via `provider_options` |
 | `gemini` | `google-genai` | Vertex AI + ADC, or API key | `function_call`/`function_response`, `response_json_schema`, `google_search` grounding |
-| `grok` | `xai-sdk` (gRPC) | `XAI_API_KEY` | stateful chat reconstructed each turn; Agent Tools `web_search` |
+| `xai` | `xai-sdk` (gRPC) | `XAI_API_KEY` | stateful chat reconstructed each turn; Agent Tools `web_search` |
 | `openai` | `openai` | `OPENAI_API_KEY` | Chat Completions; `web_search_options` + `url_citation` annotations |
 
 ---

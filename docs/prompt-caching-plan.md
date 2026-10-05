@@ -186,7 +186,7 @@ Render order is `tools → system → messages`, and a breakpoint caches *everyt
   ~15 req/min to stay warm, so a per-document key is fine and a per-message key is useless — worth
   a docstring warning.
 
-**Grok** (`providers/grok.py`) — one header.
+**Grok** (`providers/xai.py`, formerly `grok.py`) — one header.
 
 - `x-grok-conv-id: req.cache.key`. Confirm the `xai_sdk` surface for custom headers before
   committing to this (see §7).
@@ -303,7 +303,7 @@ is in the docs:
    builds the client once by design). Its `conversation_id` parameter is *not* a cache knob — the
    SDK docstring says it "is added as a span attribute (`gen_ai.conversation.id`)" for
    **OpenTelemetry** tracing. Passing it as a cache key would fake the feature. Grok still gets the
-   full §3.2 ordering win. Documented in `providers/grok.py`.
+   full §3.2 ordering win. Documented in `providers/xai.py`.
 2. **Gemini explicit `CachedContent` → RE-OPENED 2026-09-04. The measurement came back, and
    implicit caching is insufficient for a tool-using agent.** Phase 4 shipped as not-built on the
    reasoning that implicit caching "may already capture all of it". Measured against
