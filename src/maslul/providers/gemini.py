@@ -10,10 +10,13 @@ Importing this module requires the ``gemini`` extra (``pip install maslul[gemini
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import logging
+import re
 import time
+import uuid
 from collections import OrderedDict
 from typing import Any
 
@@ -23,6 +26,7 @@ from google.genai import types
 from maslul.errors import AuthError, ProviderError, RateLimited, Timeout
 from maslul.providers._common import (
     generation_params,
+    last_user_index,
     media_first,
     media_index,
     raw_options,
@@ -35,6 +39,14 @@ log = logging.getLogger(__name__)
 # How many cache handles one provider instance keeps. Each entry is a short string, so the bound is
 # about server-side hygiene (we delete on eviction), not memory.
 _MAX_HANDLES = 32
+
+# Vertex's documented stand-in for a functionCall that has no signature of its own: history another
+# provider wrote (a fallback that resumes a tool loop), or a call the caller built. Gemini 3 refuses
+# such a call with a 400 when it opens a step of the current turn. The value skips that check at
+# some cost to the answer, so it goes only where the alternative is the 400. The SDK sends bytes as
+# base64url, so these are the bytes whose encoding is the documented string.
+_SKIP_SIGNATURE = base64.urlsafe_b64decode("skip_thought_signature_validator")
+_GEMINI_MAJOR = re.compile(r"(?:^|/)gemini-(\d+)")
 
 
 class GeminiProvider:
@@ -124,7 +136,7 @@ class GeminiProvider:
         try:
             resp = await self._client.aio.models.generate_content(
                 model=spec.model,
-                contents=_contents(req),
+                contents=_contents(req, spec.model),
                 config=types.GenerateContentConfig(**config) if config else None,
             )
         except Exception as e:  # noqa: BLE001 - normalized below
@@ -142,7 +154,7 @@ class GeminiProvider:
                 try:
                     resp = await self._client.aio.models.generate_content(
                         model=spec.model,
-                        contents=_contents(req),
+                        contents=_contents(req, spec.model),
                         config=types.GenerateContentConfig(**retry) if retry else None,
                     )
                 except Exception as e2:  # noqa: BLE001 - normalized below
@@ -240,7 +252,7 @@ class GeminiProvider:
         await self._client.aio.models.generate_content(model=spec.model, contents="ping")
 
 
-def _contents(req: Request) -> list[Any]:
+def _contents(req: Request, model: str) -> list[Any]:
     """Media attaches to the last user message, or the **first** when ``ContextCache(media=True)``
     moves it into the cacheable prefix — all Gemini needs, since it caches a matching prefix
     implicitly (Gemini 2.5+). Explicit ``CachedContent`` objects are deliberately not used: they
@@ -254,6 +266,8 @@ def _contents(req: Request) -> list[Any]:
     every **parallel** tool call — two tools in one turn — a hard 400.
     """
     media_at = media_index(req.messages, req.media, req.context_cache)
+    # A turn opens at the latest user message; tool results are role "tool", not "user".
+    current_turn = last_user_index(req.messages) if _requires_signatures(model) else None
     out: list[Any] = []
     pending: list[Any] = []
 
@@ -277,12 +291,16 @@ def _contents(req: Request) -> list[Any]:
             # the signature it minted is a hard 400 on the NEXT request ("Function call is missing
             # a thought_signature in functionCall parts"), i.e. the tool loop dies on its second
             # iteration. Older models mint none; the field is then None and Gemini ignores it.
+            signatures = [tc.signature for tc in m.tool_calls]
+            # Only the first call of a step carries one, even when the model called several.
+            if current_turn is not None and i > current_turn and signatures[0] is None:
+                signatures[0] = _SKIP_SIGNATURE
             parts += [
                 types.Part(
                     function_call=types.FunctionCall(name=tc.name, args=tc.input),
-                    thought_signature=tc.signature,
+                    thought_signature=signature,
                 )
-                for tc in m.tool_calls
+                for tc, signature in zip(m.tool_calls, signatures, strict=True)
             ]
             out.append(types.Content(role="model", parts=parts))
         else:
@@ -302,6 +320,11 @@ def _contents(req: Request) -> list[Any]:
     return out
 
 
+def _requires_signatures(model: str) -> bool:
+    match = _GEMINI_MAJOR.search(model)
+    return match is not None and int(match.group(1)) >= 3
+
+
 def _response_parts(resp: Any) -> list[Any]:
     candidates = getattr(resp, "candidates", None) or []
     if not candidates:
@@ -311,7 +334,9 @@ def _response_parts(resp: Any) -> list[Any]:
 
 
 def _tool_calls(resp: Any) -> list[ToolCall]:
-    """Gemini function calls carry no id — results match back by name.
+    """Gemini function calls usually carry no id — results match back by name. A minted id is
+    unique per call anyway: a fallback that resumes the tool loop replays this transcript to a
+    provider that matches results by id, and there two calls of one tool must differ.
 
     ⚠️ Read the **parts**, not the ``resp.function_calls`` convenience accessor. That accessor
     yields bare ``FunctionCall`` objects, and Gemini 3's thought signature is not on the call — it
@@ -326,7 +351,7 @@ def _tool_calls(resp: Any) -> list[ToolCall]:
             continue
         calls.append(
             ToolCall(
-                id=getattr(fc, "id", None) or fc.name,
+                id=getattr(fc, "id", None) or f"{fc.name}-{uuid.uuid4().hex[:12]}",
                 name=fc.name,
                 input=dict(fc.args or {}),
                 signature=getattr(part, "thought_signature", None),

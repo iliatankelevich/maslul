@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
+
 from maslul.errors import MaslulError, RateLimited
 from maslul.types import ModelSpec, Request, Response, Usage
 
@@ -33,20 +35,24 @@ class FakeProvider:
 
 
 class ScriptedProvider:
-    """Returns a pre-scripted sequence of Responses, recording each Request it received.
+    """Returns a pre-scripted sequence of Responses, recording each Request it received. An error
+    in the script is raised in its place.
 
     Used to drive the router's tool-use loop deterministically: e.g. a tool-call response
     followed by a final text response.
     """
 
-    def __init__(self, name: str, responses: list[Response]) -> None:
+    def __init__(self, name: str, responses: Sequence[Response | MaslulError]) -> None:
         self.name = name
         self._responses = list(responses)
         self.requests: list[Request] = []
 
     async def complete(self, spec: ModelSpec, req: Request) -> Response:
         self.requests.append(req)
-        return self._responses.pop(0)
+        nxt = self._responses.pop(0)
+        if isinstance(nxt, MaslulError):
+            raise nxt
+        return nxt
 
     async def healthcheck(self, spec: ModelSpec) -> None:
         return None

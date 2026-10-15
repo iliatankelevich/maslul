@@ -586,6 +586,200 @@ async def test_on_error_fires_per_failed_attempt() -> None:
     assert all(isinstance(e, RateLimited) for e in errors)
 
 
+def _resilient(**knobs: Any) -> dict[str, Any]:
+    config = _config()
+    config["maslul"].update({"max_retries": 2, "retry_base_delay": 0, **knobs})
+    return config
+
+
+def _calls(*calls: ToolCall, usage: Usage | None = None) -> Response:
+    return Response("", None, "fake", "small", usage or Usage(), tool_calls=list(calls))
+
+
+def _answer(text: str = "done", usage: Usage | None = None) -> Response:
+    return Response(text, None, "fake", "small", usage or Usage())
+
+
+def _counting_executor(runs: list[str]) -> Any:
+    async def executor(call: ToolCall) -> str:
+        runs.append(call.id)
+        return f"result-{call.id}"
+
+    return executor
+
+
+def _tool_req(executor: Any, **fields: Any) -> Request:
+    return Request(
+        messages=[Message(role="user", content="go")],
+        tools=[ToolDef(name="add", description="add", input_schema={"type": "object"})],
+        tool_executor=executor,
+        **fields,
+    )
+
+
+async def test_a_retry_after_a_tool_ran_resumes_instead_of_running_it_again() -> None:
+    first = Usage(input_tokens=3, output_tokens=2)
+    provider = ScriptedProvider(
+        "fake",
+        [
+            _calls(ToolCall(id="c1", name="add", input={}), usage=first),
+            RateLimited("429 after the tool ran"),
+            _answer("It's 5.", usage=Usage(input_tokens=4, output_tokens=1)),
+        ],
+    )
+    runs: list[str] = []
+    router = Router(_resilient(), providers={"fake": provider})
+
+    resp = await router.complete(_tool_req(_counting_executor(runs)), level=Level.SIMPLE)
+
+    assert resp.text == "It's 5."
+    assert runs == ["c1"]  # once, though the model call after it failed and was retried
+    assert [c.id for c in resp.tool_calls] == ["c1"]
+    retried = provider.requests[2].messages
+    assert [m.role for m in retried] == ["user", "assistant", "tool"]  # resumed, not restarted
+    assert retried[2].content == "result-c1"
+    # the first response's tokens were spent and are part of this answer's transcript
+    assert (resp.usage.input_tokens, resp.usage.output_tokens) == (7, 3)
+
+
+async def test_a_fallback_after_a_tool_ran_resumes_on_the_next_tier() -> None:
+    from maslul import ProviderError
+
+    flaky = ScriptedProvider(
+        "flaky",
+        [_calls(ToolCall(id="c1", name="add", input={})), ProviderError("500 after the tool ran")],
+    )
+    stable = ScriptedProvider("stable", [Response("from hard", None, "stable", "big", Usage())])
+    config = {
+        "maslul": {
+            "strategy": "route_default",
+            "default_level": "simple",
+            "max_retries": 0,
+            "tiers": {
+                "simple": {"provider": "flaky", "model": "small"},
+                "hard": {"provider": "stable", "model": "big"},
+            },
+        }
+    }
+    runs: list[str] = []
+    router = Router(config, providers={"flaky": flaky, "stable": stable})
+
+    resp = await router.complete(_tool_req(_counting_executor(runs)))
+
+    assert resp.text == "from hard"
+    assert runs == ["c1"]
+    handed_over = stable.requests[0].messages
+    assert [m.role for m in handed_over] == ["user", "assistant", "tool"]
+    assert handed_over[1].tool_calls[0].id == "c1"
+    assert {r.model for r in resp.usage_records} == {"small", "big"}
+
+
+async def test_a_tool_that_raises_a_transient_error_reruns_alone() -> None:
+    provider = ScriptedProvider(
+        "fake",
+        [
+            _calls(
+                ToolCall(id="c1", name="add", input={}), ToolCall(id="c2", name="add", input={})
+            ),
+            _answer(),
+        ],
+    )
+    runs: list[str] = []
+
+    async def executor(call: ToolCall) -> str:
+        runs.append(call.id)
+        if call.id == "c2" and runs.count("c2") == 1:
+            raise RateLimited("the tool's own upstream is throttled")
+        return f"result-{call.id}"
+
+    router = Router(_resilient(), providers={"fake": provider})
+    resp = await router.complete(_tool_req(executor), level=Level.SIMPLE)
+
+    assert resp.text == "done"
+    assert runs == ["c1", "c2", "c2"]  # c1 had returned, so only c2 runs again
+    assert [c.id for c in resp.tool_calls] == ["c1", "c2"]  # each reported once
+    assert len(provider.requests) == 2  # and the model is not asked for the calls a second time
+    final = provider.requests[1].messages
+    assert [(m.role, m.tool_call_id) for m in final[2:]] == [("tool", "c1"), ("tool", "c2")]
+
+
+async def test_retries_on_one_tier_share_its_iteration_budget() -> None:
+    from maslul import ProviderError
+
+    def call(n: int) -> Response:
+        return _calls(ToolCall(id=f"c{n}", name="add", input={}))
+
+    script: list[Response | RateLimited] = [call(n) for n in range(4)]
+    script += [RateLimited("mid-loop"), *(call(n) for n in range(4, 50))]
+    provider = ScriptedProvider("fake", script)
+    runs: list[str] = []
+    router = Router(_resilient(fallback=False), providers={"fake": provider})
+
+    with pytest.raises(ProviderError, match="iterations"):
+        await router.complete(_tool_req(_counting_executor(runs)), level=Level.SIMPLE)
+    assert len(runs) == 8  # the retry continued the tier's count instead of starting a fresh one
+
+
+async def test_a_tier_that_spent_its_budget_falls_back_and_the_next_tier_resumes() -> None:
+    def call(n: int) -> Response:
+        return _calls(ToolCall(id=f"c{n}", name="add", input={}))
+
+    looping = ScriptedProvider("looping", [call(n) for n in range(8)])
+    stable = ScriptedProvider("stable", [Response("concluded", None, "stable", "big", Usage())])
+    config = {
+        "maslul": {
+            "strategy": "route_default",
+            "default_level": "simple",
+            "retry_base_delay": 0,
+            "tiers": {
+                "simple": {"provider": "looping", "model": "small"},
+                "hard": {"provider": "stable", "model": "big"},
+            },
+        }
+    }
+    runs: list[str] = []
+    router = Router(config, providers={"looping": looping, "stable": stable})
+
+    resp = await router.complete(_tool_req(_counting_executor(runs)))
+
+    assert resp.text == "concluded"  # the stronger tier answers from the eight rounds' results
+    assert runs == [f"c{n}" for n in range(8)]  # and none of them ran again
+    assert len(stable.requests[0].messages) == 1 + 8 * 2
+
+
+async def test_a_resumed_loop_does_not_force_the_tool_choice_again() -> None:
+    provider = ScriptedProvider(
+        "fake",
+        [_calls(ToolCall(id="c1", name="add", input={})), RateLimited("429"), _answer()],
+    )
+    router = Router(_resilient(), providers={"fake": provider})
+    await router.complete(_tool_req(_counting_executor([]), tool_choice="add"), level=Level.SIMPLE)
+    assert [r.tool_choice for r in provider.requests] == ["add", None, None]
+
+
+async def test_a_fallback_tier_does_not_force_the_tool_choice_again() -> None:
+    from maslul import ProviderError
+
+    flaky = ScriptedProvider(
+        "flaky", [_calls(ToolCall(id="c1", name="add", input={})), ProviderError("500")]
+    )
+    stable = ScriptedProvider("stable", [Response("ok", None, "stable", "big", Usage())])
+    config = {
+        "maslul": {
+            "strategy": "route_default",
+            "default_level": "simple",
+            "max_retries": 0,
+            "tiers": {
+                "simple": {"provider": "flaky", "model": "small"},
+                "hard": {"provider": "stable", "model": "big"},
+            },
+        }
+    }
+    router = Router(config, providers={"flaky": flaky, "stable": stable})
+    await router.complete(_tool_req(_counting_executor([]), tool_choice="add"))
+    assert [r.tool_choice for r in flaky.requests + stable.requests] == ["add", None, None]
+
+
 async def test_forced_tool_choice_applies_to_the_first_turn_only() -> None:
     call = ToolCall(id="c1", name="add", input={"a": 2, "b": 3})
     provider = ScriptedProvider(
