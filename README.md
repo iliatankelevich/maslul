@@ -169,8 +169,11 @@ router = Router.from_toml("maslul.toml", on_complete=on_usage)
 
 Transient errors (`RateLimited`, `Timeout`) retry with exponential backoff; on persistent failure
 the request **falls back to the next-higher tier** — which may be a different provider, giving you
-cross-provider failover for free. `AuthError` fails fast. Hooks: `on_route` (the `RoutingDecision`),
-`on_complete` (the final `Response` with `usage_records`), `on_error` (each failed attempt).
+cross-provider failover for free. A tool loop **resumes** across those attempts: a model call that
+fails after tools ran continues from their results, so no tool runs twice for one request, and the
+usage of every call that succeeded is counted. `AuthError` fails fast. Hooks: `on_route` (the
+`RoutingDecision`), `on_complete` (the final `Response` with `usage_records`), `on_error` (each
+failed attempt).
 
 Build a router with `missing_provider="degrade"` and any tier whose provider isn't configured
 (e.g. an xAI tier with no `XAI_API_KEY`) **falls back to the nearest available tier** instead of

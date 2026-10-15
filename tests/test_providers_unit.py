@@ -354,6 +354,108 @@ async def test_gemini_tool_call_without_a_signature_replays_cleanly() -> None:
     assert fake.calls[1]["contents"][1].parts[0].thought_signature is None
 
 
+async def test_gemini_mints_a_distinct_id_for_each_call_without_one() -> None:
+    # A fallback can replay this transcript to a provider that matches results by id, where two
+    # calls of one tool sharing an id (the tool's name, as they used to) cannot be told apart.
+    resp = _gemini_call_resp(b"sig")
+    first = resp.candidates[0].content.parts[0]
+    resp.candidates[0].content.parts.append(
+        SimpleNamespace(function_call=first.function_call, thought_signature=None)
+    )
+    provider = GeminiProvider(client=_FakeGemini(resp))
+    out = await provider.complete(
+        ModelSpec(provider="gemini", model="gemini-3.5-flash"),
+        Request(messages=[Message(role="user", content="2+3, twice?")], tools=[_TOOL]),
+    )
+    ids = [c.id for c in out.tool_calls]
+    assert len(set(ids)) == 2 and all(i.startswith("add-") for i in ids)
+
+
+async def test_gemini_keeps_an_id_the_model_sent() -> None:
+    resp = _gemini_call_resp(None)
+    resp.candidates[0].content.parts[0].function_call.id = "call-7"
+    out = await GeminiProvider(client=_FakeGemini(resp)).complete(
+        ModelSpec(provider="gemini", model="gemini-3.5-flash"),
+        Request(messages=[Message(role="user", content="2+3?")], tools=[_TOOL]),
+    )
+    assert out.tool_calls[0].id == "call-7"
+
+
+def _foreign_turn(*, earlier_turn: bool = False) -> list[Message]:
+    # Another provider's calls: no signature on any of them.
+    calls = [
+        ToolCall(id="toolu_1", name="add", input={"a": 2, "b": 3}),
+        ToolCall(id="toolu_2", name="add", input={"a": 1, "b": 1}),
+    ]
+    messages = [
+        Message(role="user", content="2+3 and 1+1?"),
+        Message(role="assistant", tool_calls=calls),
+        Message(role="tool", content="5", tool_call_id="toolu_1", name="add"),
+        Message(role="tool", content="2", tool_call_id="toolu_2", name="add"),
+    ]
+    if earlier_turn:
+        messages += [
+            Message(role="assistant", content="5 and 2."),
+            Message(role="user", content="ok"),
+        ]
+    return messages
+
+
+async def test_gemini_3_replays_an_unsigned_call_with_the_documented_skip_value() -> None:
+    """Gemini 3 400s on a step of the current turn whose first functionCall has no signature, which
+    is every step another provider wrote: a fallback that resumes a tool loop sends exactly that.
+    Vertex documents one value that skips the check; the SDK must put it on the wire verbatim."""
+    from google.genai import _common
+
+    fake = _FakeGemini(_gemini_call_resp(None))
+    spec = ModelSpec(provider="gemini", model="gemini-3.8-pro")
+    await GeminiProvider(client=fake).complete(
+        spec, Request(messages=_foreign_turn(), tools=[_TOOL])
+    )
+    first, second = fake.calls[0]["contents"][1].parts
+    wire = _common.encode_unserializable_types({"sig": first.thought_signature})
+    assert wire == {"sig": "skip_thought_signature_validator"}
+    assert second.thought_signature is None  # only a step's first call carries one
+
+
+async def test_gemini_3_leaves_signed_calls_and_earlier_turns_alone() -> None:
+    fake = _FakeGemini(_gemini_call_resp(None))
+    spec = ModelSpec(provider="gemini", model="gemini-3.8-pro")
+    provider = GeminiProvider(client=fake)
+    await provider.complete(spec, Request(messages=_foreign_turn(earlier_turn=True), tools=[_TOOL]))
+    assert fake.calls[0]["contents"][1].parts[0].thought_signature is None  # not enforced there
+
+    signed = [
+        Message(role="user", content="2+3?"),
+        Message(
+            role="assistant", tool_calls=[ToolCall(id="c1", name="add", input={}, signature=b"own")]
+        ),
+        Message(role="tool", content="5", tool_call_id="c1", name="add"),
+    ]
+    await provider.complete(spec, Request(messages=signed, tools=[_TOOL]))
+    assert fake.calls[1]["contents"][1].parts[0].thought_signature == b"own"
+
+
+@pytest.mark.parametrize(
+    ("model", "enforced"),
+    [
+        ("gemini-3.8-flash", True),
+        ("gemini-3-pro-preview", True),
+        ("publishers/google/models/gemini-3.5-flash-lite", True),
+        ("gemini-12-ultra", True),
+        ("gemini-2.5-flash", False),
+        ("projects/p/locations/l/endpoints/123", False),
+    ],
+)
+async def test_gemini_skip_value_follows_the_model_generation(model: str, enforced: bool) -> None:
+    fake = _FakeGemini(_gemini_call_resp(None))
+    spec = ModelSpec(provider="gemini", model=model)
+    await GeminiProvider(client=fake).complete(
+        spec, Request(messages=_foreign_turn(), tools=[_TOOL])
+    )
+    assert (fake.calls[0]["contents"][1].parts[0].thought_signature is not None) is enforced
+
+
 async def test_gemini_parallel_tool_results_collapse_into_one_turn() -> None:
     """Gemini counts PARTS per turn, not ids: a model turn with N functionCall parts must be
     answered by ONE turn with N functionResponse parts. One content per result 400s the moment a

@@ -30,7 +30,7 @@ import os
 import random
 import re
 from collections.abc import Mapping, Sequence
-from dataclasses import replace
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 from maslul.cache import Embedder, ResponseCache
@@ -53,6 +53,7 @@ from maslul.types import (
     RoutingDecision,
     Strategy,
     ToolCall,
+    ToolExecutor,
     Usage,
     Verifier,
     canonical_provider,
@@ -371,12 +372,27 @@ class Router:
     ) -> Response:
         """Run the answer with resilience: try the model (retrying transient errors), and on
         persistent failure fall back to the next-higher tier. ``AuthError`` never retries or
-        falls back — it's a configuration problem."""
+        falls back — it's a configuration problem.
+
+        A tool loop survives its failed attempts: the next one resumes from the results already in
+        hand, so no tool runs twice for one request, and the usage of every model call that
+        succeeded is counted."""
+        ledger: dict[tuple[str, str], Usage] = {}
+        if classification is not None:
+            _record_usage(
+                ledger, classification.provider, classification.model, classification.usage
+            )
+        has_tools = bool(req.tools) and req.tool_executor is not None
+        turn = _ToolTurn(list(req.messages)) if has_tools else None
         last: MaslulError | None = None
         for fallback_spec in self._fallback_chain(spec, level):
+            if turn is not None:
+                turn.responses = 0
             for attempt in range(self._config.max_retries + 1):
                 try:
-                    return await self._execute_once(fallback_spec, req, classification)
+                    return await self._execute_once(
+                        fallback_spec, req, ledger, turn, classification
+                    )
                 except AuthError:
                     raise
                 except (RateLimited, Timeout) as e:  # transient → retry this model, then fall back
@@ -395,19 +411,19 @@ class Router:
         raise last if last is not None else ProviderError("no model available to execute request")
 
     async def _execute_once(
-        self, spec: ModelSpec, req: Request, classification: ModelUsage | None
+        self,
+        spec: ModelSpec,
+        req: Request,
+        ledger: dict[tuple[str, str], Usage],
+        turn: _ToolTurn | None,
+        classification: ModelUsage | None,
     ) -> Response:
         provider = self._provider_for(spec)
-        ledger: dict[tuple[str, str], Usage] = {}
-        if classification is not None:
-            _record_usage(
-                ledger, classification.provider, classification.model, classification.usage
-            )
-        if not req.tools or req.tool_executor is None:
+        if turn is None:
             resp = await self._invoke(provider, spec, req)
             _record(ledger, resp)
         else:
-            resp = await self._run_tool_loop(spec, provider, req, ledger)
+            resp = await self._run_tool_loop(spec, provider, req, ledger, turn=turn)
         return self._finalize(req, resp, ledger, classification)
 
     async def _invoke(self, provider: Provider, spec: ModelSpec, req: Request) -> Response:
@@ -460,36 +476,38 @@ class Router:
         ledger: dict[tuple[str, str], Usage],
         *,
         seed: Response | None = None,
+        turn: _ToolTurn | None = None,
     ) -> Response:
         """Drive the provider-agnostic tool loop. ``seed`` is an already-fetched first response
-        (e.g. CLASSIFY_AND_ANSWER's answer turn) — used as turn 1 instead of making a fresh call."""
+        (e.g. CLASSIFY_AND_ANSWER's answer turn) — used as turn 1 instead of making a fresh call.
+        ``turn`` is an earlier attempt's progress on the same request, which this one resumes."""
         executor = req.tool_executor
         assert executor is not None
-        messages = list(req.messages)
-        executed: list[ToolCall] = []
+        turn = turn if turn is not None else _ToolTurn(list(req.messages))
         resp = seed
-        for _ in range(_MAX_TOOL_ITERATIONS):
+        while True:
+            await _answer_pending(turn, executor)
+            if turn.responses >= _MAX_TOOL_ITERATIONS:
+                raise ProviderError(f"tool loop exceeded {_MAX_TOOL_ITERATIONS} iterations")
             if resp is None:
-                resp = await self._invoke(provider, spec, replace(req, messages=messages))
+                choice = req.tool_choice
+                if turn.executed and choice not in (None, "auto", "none"):
+                    # A forced choice ("required" or a tool name) is for the first turn only: kept,
+                    # it would force another call every turn and the model could never answer.
+                    choice = None
+                resp = await self._invoke(
+                    provider, spec, replace(req, messages=list(turn.messages), tool_choice=choice)
+                )
+            turn.responses += 1
             _record(ledger, resp)
             if not resp.tool_calls:
-                resp.tool_calls = executed  # surface the full tool I/O of the turn
+                resp.tool_calls = list(turn.executed)  # surface the full tool I/O of the turn
                 return resp
-            messages.append(
+            turn.messages.append(
                 Message(role="assistant", content=resp.text, tool_calls=resp.tool_calls)
             )
-            for call in resp.tool_calls:
-                executed.append(call)
-                result = await executor(call)
-                messages.append(
-                    Message(role="tool", content=result, tool_call_id=call.id, name=call.name)
-                )
-            if req.tool_choice not in (None, "auto", "none"):
-                # A forced choice ("required" or a tool name) is for the first turn only: kept, it
-                # would force another call every turn and the model could never answer.
-                req = replace(req, tool_choice=None)
+            turn.pending = list(resp.tool_calls)
             resp = None
-        raise ProviderError(f"tool loop exceeded {_MAX_TOOL_ITERATIONS} iterations")
 
     def _require_classifier(self) -> ModelSpec:
         if self._config.classifier is None:
@@ -517,6 +535,32 @@ class Router:
                 f"no provider registered for {spec.provider!r} "
                 f"(registered: {sorted(self._providers)})"
             ) from e
+
+
+@dataclass
+class _ToolTurn:
+    # One request's tool loop, kept across its retries and fallbacks. A model call that fails after
+    # tools ran must not run them again: a repeated read is a wasted query, but a repeated write is
+    # a side effect the user asked for once, applied twice. Every attempt resumes from here.
+    messages: list[Message]
+    executed: list[ToolCall] = field(default_factory=list)
+    # Calls the last model response made that have no result yet: a tool that raised is retried,
+    # its siblings that returned are not.
+    pending: list[ToolCall] = field(default_factory=list)
+    # Responses from the current tier's model. Its retries share the iteration budget, so a retry is
+    # not a fresh one; a fallback tier gets its own, and continues the transcript.
+    responses: int = 0
+
+
+async def _answer_pending(turn: _ToolTurn, executor: ToolExecutor) -> None:
+    while turn.pending:
+        call = turn.pending[0]
+        result = await executor(call)
+        turn.executed.append(call)
+        turn.messages.append(
+            Message(role="tool", content=result, tool_call_id=call.id, name=call.name)
+        )
+        del turn.pending[0]
 
 
 # Intent verbs that mark genuinely hard work — Hebrew + English (plan §1.2).
