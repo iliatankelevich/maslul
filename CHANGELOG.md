@@ -6,31 +6,6 @@ All notable changes to **maslul** are documented here. The format follows
 
 ## [Unreleased]
 
-### Fixed
-
-- **A retry or a fallback re-ran every tool the request had already run.** Each attempt restarted
-  the tool loop from the request's own messages, so a `RateLimited` or `Timeout` after a tool
-  call ran the tool again on the retry, and again on each tier the request fell back to. That is a
-  wasted query for a read and a repeated side effect for a write. The loop now resumes: the next
-  attempt continues from the results already in hand, on the same model or on the fallback tier. A
-  tool that raised a retryable error runs again, and the calls beside it that returned do not. A
-  tier's retries share its eight-iteration cap, and a fallback tier starts its own on the resumed
-  transcript (before, every retry restarted the cap). A forced `tool_choice` is not forced again on
-  a resumed turn, and `usage` / `usage_records` now include the model calls of an attempt that
-  failed later, since their output is part of the transcript the answer was built on.
-  `classify_and_answer`'s inline answer and `verify_cascade`'s escalation are unchanged.
-- **Gemini gave two calls of one tool the same id.** With no id from the model, a call's id was the
-  tool's name. It is now `<name>-<random>`, unique per call; an id the model sends is kept.
-  Gemini still matches results by name, so only callers that keyed on the id see a difference.
-
-### Added
-
-- **Gemini 3 accepts tool calls another provider made.** Gemini 3 refuses a step of the current
-  turn whose first `functionCall` carries no thought signature, which is what a fallback that
-  resumes another provider's tool loop sends. Such a call now carries Vertex's documented
-  validator-skip value. A call with its own signature, a call in an earlier turn, and every
-  model before Gemini 3 are sent exactly as before.
-
 ## [0.6.0] - 2026-10-05
 
 ### Added
@@ -58,6 +33,11 @@ All notable changes to **maslul** are documented here. The format follows
   to — and this works on all four providers. The unscoped form keeps its old behaviour (applied on
   Anthropic and OpenAI, ignored on Gemini and xAI). `classify_and_answer`'s guidance also reaches a
   scoped `provider_options["anthropic"]["system"]`.
+- **Gemini 3 accepts tool calls another provider made.** Gemini 3 refuses a step of the current
+  turn whose first `functionCall` carries no thought signature, which is what a fallback that
+  resumes another provider's tool loop sends. Such a call now carries Vertex's documented
+  validator-skip value. A call with its own signature, a call in an earlier turn, and every
+  model before Gemini 3 are sent exactly as before.
 
 ### Changed
 
@@ -84,6 +64,20 @@ All notable changes to **maslul** are documented here. The format follows
   now accept them.
 - **`Request.stop` was ignored on xAI.** It is now sent as `chat.create(stop=...)`, like the other
   three providers.
+- **A retry or a fallback re-ran every tool the request had already run.** Each attempt restarted
+  the tool loop from the request's own messages, so a `RateLimited` or `Timeout` after a tool
+  call ran the tool again on the retry, and again on each tier the request fell back to. That is a
+  wasted query for a read and a repeated side effect for a write. The loop now resumes: the next
+  attempt continues from the results already in hand, on the same model or on the fallback tier. A
+  tool that raised a retryable error runs again, and the calls beside it that returned do not. A
+  tier's retries share its eight-iteration cap, and a fallback tier starts its own on the resumed
+  transcript (before, every retry restarted the cap). A forced `tool_choice` is not forced again on
+  a resumed turn, and `usage` / `usage_records` now include the model calls of an attempt that
+  failed later, since their output is part of the transcript the answer was built on.
+  `classify_and_answer`'s inline answer and `verify_cascade`'s escalation are unchanged.
+- **Gemini gave two calls of one tool the same id.** With no id from the model, a call's id was the
+  tool's name. It is now `<name>-<random>`, unique per call; an id the model sends is kept.
+  Gemini still matches results by name, so only callers that keyed on the id see a difference.
 
 ### Deprecated
 
