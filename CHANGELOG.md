@@ -94,6 +94,12 @@ All notable changes to **maslul** are documented here. The format follows
   extras; add a *Model parameters* section (the generic-to-provider mapping table, raw options,
   precedence, and the model-specific refusals to know about); the Gemini config example moves off
   the access-limited 2.5 line.
+- README: the prompt-caching table now covers Gemini's explicit cache (on with `ttl_seconds`,
+  since 0.4.0), and the provider list says which drivers send PDFs as documents (Anthropic,
+  Gemini) and which send every attachment as an image (OpenAI, xAI).
+- `docs/ARCHITECTURE.md` brought up to date: four providers, the response cache and prompt
+  caching, the Jev hooks and the resumable tool loop. `docs/prompt-caching-plan.md` is marked
+  implemented and kept as the design record.
 
 ## [0.5.0] - 2026-10-01
 

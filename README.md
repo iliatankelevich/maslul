@@ -90,7 +90,7 @@ routed, in this precedence order:
 ```python
 from maslul import Level
 
-await router.complete(req, model="anthropic:claude-opus-4-8")  # 0. pin an exact model
+await router.complete(req, model="anthropic:claude-opus-5-5")  # 0. pin an exact model
 await router.complete(req, level=Level.HARD)                   # 1. pin a difficulty tier
 await router.complete(req)                                     # 2-4. let the router decide
 ```
@@ -148,7 +148,7 @@ req = Request(messages=[Message(role="user", content="Extract name + age")],
               response_format={"type": "object", "properties": {"name": {"type": "string"},
                                                                 "age": {"type": "integer"}}})
 
-# Vision — images / PDFs
+# Vision — images on every provider; PDFs on Anthropic and Gemini
 req = Request(messages=[Message(role="user", content="What's in this image?")],
               media=[MediaPart(mime_type="image/png", data=png_bytes)])
 
@@ -206,7 +206,9 @@ from cache for a tenth of the price, but only if you tell it what's stable.
 
 You declare **what is stable**, never a mechanism. Anthropic gets explicit `cache_control`
 breakpoints; Gemini, OpenAI and xAI cache a matching *prefix* automatically, so what they need is
-**layout** — and that's the one lever that works on all four:
+**layout** — and that's the one lever that works on all four. Set `ttl_seconds` and Gemini also
+puts the system prompt and tools into an explicit server-side cache, which catches the mid-sized
+prompts its automatic caching misses:
 
 ```python
 from maslul import ContextCache, MediaPart, Message, Request
@@ -230,10 +232,10 @@ question went **$0.237 → $0.024**.
 
 | | Anthropic | Gemini | OpenAI | xAI |
 |---|---|---|---|---|
-| Mechanism | explicit `cache_control` breakpoints (≤ 4, budgeted for you) | implicit prefix | implicit prefix | implicit prefix |
-| `system` / `media` / `history` | ✅ (`system` also covers **tools**) | layout only | layout only | layout only |
-| `ttl_seconds` | 5 min, or 1 h at `>= 3600` | — | `24h` retention at `>= 3600` | — |
-| `key` | — | — | `prompt_cache_key` | — (no-op: `xai_sdk` has no per-request headers) |
+| Mechanism | explicit `cache_control` breakpoints (≤ 4, budgeted for you) | implicit prefix, plus an explicit `CachedContent` when `ttl_seconds` is set | implicit prefix | implicit prefix |
+| `system` / `media` / `history` | ✅ (`system` also covers **tools**) | layout; with `ttl_seconds`, `system` + tools go into the explicit cache | layout only | layout only |
+| `ttl_seconds` | 5 min, or 1 h at `>= 3600` | turns on the explicit cache, as its TTL | `24h` retention at `>= 3600` | — |
+| `key` | — | names the explicit cache, reused per key | `prompt_cache_key` | — (no-op: `xai_sdk` has no per-request headers) |
 
 Two things to know. **Caches are model-scoped and the router picks the model** — a cache written on
 `simple` is cold on `hard`, so pair `media=True` with a pinned model; maslul emits exactly what you
@@ -357,6 +359,9 @@ set model-specific parameters on the tier.
 | `gemini` | `google-genai` | Vertex AI + ADC (`vertex_project`), or a Gemini Developer API key |
 | `xai` | `xai-sdk` | `XAI_API_KEY` |
 | `openai` | `openai` | `OPENAI_API_KEY` |
+
+Images work on all four. PDFs are sent as documents on Anthropic and Gemini; the OpenAI and xAI
+drivers send every attachment as an image, so route PDF requests to an Anthropic or Gemini tier.
 
 Provider names follow the API vendor, so xAI's Grok models are `xai:grok-4.3`. The pre-0.6 name
 `grok` (provider key, `maslul[grok]` extra, `maslul.providers.grok`) still works as a deprecated

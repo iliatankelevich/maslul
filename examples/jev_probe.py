@@ -16,7 +16,7 @@ async def main() -> None:
     classifier = JevClassifier()
     verifier = JevVerifier()
 
-    simple = Request(messages=[Message(role="user", content="תודה קיפי!")])
+    simple = Request(messages=[Message(role="user", content="תודה רבה!")])
     hard = Request(
         messages=[
             Message(
