@@ -6,7 +6,7 @@ All notable changes to **maslul** are documented here. The format follows
 
 ## [Unreleased]
 
-## [0.6.0] - 2026-10-05
+## [0.6.0] - 2026-10-22
 
 ### Added
 
