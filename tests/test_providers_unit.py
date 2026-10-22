@@ -112,6 +112,27 @@ async def test_gemini_normalizes_text_usage_and_finish_reason() -> None:
     assert out.finish_reason == "STOP"
 
 
+@pytest.mark.parametrize(("thoughts", "expected"), [(338, 339), (None, 1)])
+async def test_gemini_output_tokens_include_thoughts(thoughts: int | None, expected: int) -> None:
+    """Gemini reports thinking as ``thoughts_token_count``, outside ``candidates_token_count``, and
+    bills it as output, so a thinking model's output is their sum. A model that did not think
+    reports ``None``."""
+    resp = SimpleNamespace(
+        text="391",
+        usage_metadata=SimpleNamespace(
+            prompt_token_count=20,
+            candidates_token_count=1,
+            thoughts_token_count=thoughts,
+            cached_content_token_count=0,
+        ),
+        candidates=[SimpleNamespace(finish_reason=SimpleNamespace(name="STOP"))],
+    )
+    out = await GeminiProvider(client=_FakeGemini(resp)).complete(
+        ModelSpec(provider="gemini", model="gemini-3.8-flash"), _req()
+    )
+    assert out.usage.output_tokens == expected
+
+
 async def test_gemini_applies_tier_options_but_not_request_provider_options() -> None:
     resp = SimpleNamespace(text="ok", usage_metadata=None, candidates=[])
     fake = _FakeGemini(resp)
@@ -166,6 +187,26 @@ async def test_xai_normalizes_text_usage_and_finish_reason() -> None:
     assert (out.usage.input_tokens, out.usage.output_tokens) == (4, 2)
     assert out.finish_reason == "stop"
     assert fake.calls[0]["model"] == "grok-4.3"
+
+
+async def test_xai_output_tokens_include_reasoning() -> None:
+    """xAI reports ``reasoning_tokens`` beside ``completion_tokens`` and bills both as output. The
+    numbers are a live grok-4.3 call at ``reasoning="high"``."""
+    resp = SimpleNamespace(
+        content="391",
+        usage=SimpleNamespace(
+            prompt_tokens=196,
+            completion_tokens=1,
+            reasoning_tokens=338,
+            cached_prompt_text_tokens=128,
+        ),
+        finish_reason="stop",
+    )
+    out = await XAIProvider(client=_FakeXAI(resp)).complete(
+        ModelSpec(provider="xai", model="grok-4.3"), _req()
+    )
+    assert out.usage.output_tokens == 339
+    assert (out.usage.input_tokens, out.usage.cache_read_input_tokens) == (68, 128)
 
 
 async def test_xai_passes_stop_and_tier_options() -> None:

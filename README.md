@@ -315,7 +315,8 @@ reasoning = "high"
 A **—** means the provider has no equivalent, and the value is ignored. Turning `reasoning` on also
 drops the sampling parameters that reasoning models refuse: `temperature`, `top_p` and `top_k` on
 Anthropic, `temperature`, `top_p` and `stop` on OpenAI, `stop` on xAI. A forced `tool_choice`
-applies to the first turn of the tool loop only, so the model can still answer.
+applies to the first turn of the tool loop only, so the model can still answer. Reasoning tokens
+are billed as output, and `usage.output_tokens` counts them on every provider.
 
 **Raw options, when the generic set isn't enough.** A tier's `options` table takes raw SDK keywords
 for that model, under each SDK's own names (Anthropic `messages.create()`, OpenAI

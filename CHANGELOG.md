@@ -78,6 +78,12 @@ All notable changes to **maslul** are documented here. The format follows
 - **Gemini gave two calls of one tool the same id.** With no id from the model, a call's id was the
   tool's name. It is now `<name>-<random>`, unique per call; an id the model sends is kept.
   Gemini still matches results by name, so only callers that keyed on the id see a difference.
+- **xAI and Gemini under-reported output tokens whenever the model reasoned.** Both report
+  reasoning apart from the answer — xAI as `reasoning_tokens`, Gemini as `thoughts_token_count` —
+  and bill it as output, but `output_tokens` counted only the answer: a live grok-4.3 call at
+  `reasoning="high"` was billed 339 output tokens and reported 1. `output_tokens` now includes
+  them, as it already did on Anthropic and OpenAI. Most Gemini 2.5+ models think by default, so
+  their reported usage rises even without `reasoning` set.
 
 ### Deprecated
 
