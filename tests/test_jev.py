@@ -202,7 +202,7 @@ async def test_hebrew_state_passes_through_unmangled() -> None:
 
     client = _client(handler)
     classifier = JevClassifier(client)
-    hebrew = "תודה קיפי! מה השעה עכשיו?"
+    hebrew = "תודה רבה! מה השעה עכשיו?"
     await classifier(_req(hebrew))
     assert hebrew in captured["body"]["state"]
 

@@ -22,6 +22,8 @@ src/maslul/
 ├─ errors.py          MaslulError hierarchy
 ├─ config.py          RouterConfig — parse from TOML or a dict
 ├─ router.py          Router — the routing brain, the tool loop, resilience, hooks
+├─ cache.py           ResponseCache — the exact / semantic response cache
+├─ jev.py             TypeSafe Jev classifier + verifier hooks   (extra: jev)
 └─ providers/
    ├─ base.py         Provider Protocol
    ├─ __init__.py     build_provider() factory (lazy, SDK-free)
@@ -29,7 +31,8 @@ src/maslul/
    ├─ anthropic.py    AnthropicProvider   (extra: anthropic)
    ├─ gemini.py       GeminiProvider      (extra: gemini)
    ├─ xai.py          XAIProvider         (extra: xai)
-   └─ openai.py       OpenAIProvider      (extra: openai)
+   ├─ openai.py       OpenAIProvider      (extra: openai)
+   └─ grok.py         deprecated alias of xai.py
 ```
 
 **The core is stdlib-only and import-light.** `import maslul` pulls in *no* provider SDK — a
@@ -64,7 +67,7 @@ Request(messages, system, tools, tool_executor, response_format, media, server_t
         seed, stop, reasoning, tool_choice, provider_options, metadata)
 
 Response(text, level_used, provider, model, usage, structured, tool_calls, finish_reason,
-         sources, classification_usage, usage_records, raw)
+         sources, classification_usage, usage_records, cached, raw)
 ```
 
 The generation parameters (`max_tokens` through `tool_choice`) are generic: each provider
@@ -119,7 +122,9 @@ are injectable; `default_hard_signal` is the built-in.
 A caller-supplied **`classifier`** (sync or async) takes precedence over the configured strategy for
 the middle — that's how you plug in your own difficulty logic. The result of routing is a
 `RoutingDecision` (`spec`, `level`, `reason`, optional `classification` usage), handed to the
-`on_route` hook before the model runs.
+`on_route` hook before the model runs. `maslul.jev` (extra `jev`) ships a ready-made `classifier`
+and `verifier` backed by TypeSafe Jev; `Router` never wires them itself, they are passed in like
+any other hook.
 
 ---
 
@@ -139,7 +144,7 @@ class Provider(Protocol):
 - **Client-side tools** (your functions) are looped by the **`Router`**, provider-agnostically: call
   the model, surface `tool_calls`, run `req.tool_executor`, append the results as normalized
   messages, repeat until the model stops (bounded by an iteration guard). Because it works on
-  *normalized* messages, the same loop drives all three providers.
+  *normalized* messages, the same loop drives all four providers.
 - **Server-side tools** (web search) are resolved **inside the provider**. The normalized way to ask
   for it is **`Request.web_search=True`** — every provider then enables its own grounding and
   normalizes citations into `Response.sources`, so the caller never picks a provider-specific
@@ -157,14 +162,15 @@ returns either a client `tool_use` (which the Router loop handles) or the final 
 full-capability turn (client tools + web search), still able to escalate via the sentinel.
 
 Each provider also normalizes: messages/system, tool defs + the call/result round-trip, structured
-output (`response_format` → `Response.structured`), vision (`MediaPart` image/PDF), token `Usage`
+output (`response_format` → `Response.structured`), vision (`MediaPart` images on all four, PDFs
+on Anthropic and Gemini), token `Usage`
 (incl. cache tokens), and **errors** → the `MaslulError` hierarchy so the resilience layer can act
 on them.
 
 | Provider | SDK | Auth | Notes |
 |---|---|---|---|
-| `anthropic` | `anthropic` | `ANTHROPIC_API_KEY` | `web_search` server tool (pause/resume), prompt caching via `provider_options` |
-| `gemini` | `google-genai` | Vertex AI + ADC, or API key | `function_call`/`function_response`, `response_json_schema`, `google_search` grounding |
+| `anthropic` | `anthropic` | `ANTHROPIC_API_KEY` | `web_search` server tool (pause/resume); `cache_control` breakpoints from `ContextCache` |
+| `gemini` | `google-genai` | Vertex AI + ADC, or API key | `function_call`/`function_response`, `response_json_schema`, `google_search` grounding; explicit `CachedContent` when `ContextCache.ttl_seconds` is set |
 | `xai` | `xai-sdk` (gRPC) | `XAI_API_KEY` | stateful chat reconstructed each turn; Agent Tools `web_search` |
 | `openai` | `openai` | `OPENAI_API_KEY` | Chat Completions; `web_search_options` + `url_citation` annotations |
 
@@ -178,6 +184,9 @@ The answer is wrapped in router-level resilience:
 - **Per-call timeout** (`request_timeout`) mapped to a retryable `Timeout`.
 - **Fallback**: on persistent failure, escalate to the next-higher tier — which may be a *different
   provider*, giving cross-provider failover from the tier config alone.
+- **The tool loop resumes** across retries and fallbacks: the next attempt continues from the tool
+  results already in hand, so no tool runs twice for one request. Each tier gets its own iteration
+  budget, and `usage_records` include every call that succeeded, even in an attempt that later failed.
 - **`AuthError` fails fast** — a key/permission problem won't be cured by retrying or falling back.
 
 The `MaslulError` hierarchy: `ConfigError` and `ProviderError` under `MaslulError`, with
@@ -197,6 +206,22 @@ Three hooks (constructor args or `router.on_*()` registration):
 For cost/usage monitoring, `Response.usage_records` is a **per-`(provider, model)` breakdown** — a
 single request can span several models (a classifier + an answer model + tool-loop iterations), and
 each is attributed separately; `Response.usage` is their sum.
+
+---
+
+## Caching — two layers
+
+- **Response cache** (`cache.py`, `[maslul.cache]`): *don't call the model at all*. Checked in
+  `complete()` before routing, for tool-free requests only (a cached tool call would re-run against
+  stale state). `exact` matches the request; `semantic` cosine-matches an embedding from a caller-
+  injected `embed`, since maslul ships none. A hit returns `cached=True` with zeroed usage.
+- **Prompt caching** (`Request.context_cache`, a `ContextCache`): *call the model, but pay less for
+  the prefix it has already seen*. A hint, not a command — the caller declares what is stable, and
+  each provider honours it as best it can. The portable lever is layout: `media=True` moves media
+  to the first user message, ahead of its text, so it sits in the stable prefix every provider
+  caches. Anthropic adds `cache_control` breakpoints within its budget of four; Gemini adds an
+  explicit `CachedContent` for the system prompt and tools when `ttl_seconds` is set. The design
+  record and measurements are in [prompt-caching-plan.md](prompt-caching-plan.md).
 
 ---
 

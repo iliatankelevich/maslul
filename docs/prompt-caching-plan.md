@@ -1,11 +1,11 @@
 # Plan — portable prompt caching (context caching)
 
-**Status:** phases **1–3 implemented** (unreleased, targeting v0.3.0); phase 4 deliberately not built.
-Two deviations from the text below, both deliberate — the `Request` field is named **`context_cache`**,
-not `cache` (`req.cache` collides with the response cache this document opens by warning about), and
-the history breakpoint goes on the **last** turn, not the last *completed* turn (Anthropic's own
-multi-turn guidance says the most-recently-appended turn, which caches strictly more). §7's open
-questions are now answered — see the notes inline. Remaining: validate in a real consumer (§8).
+**Status:** implemented. Phases 1–3 shipped in 0.3.0 and phase 4 (Gemini explicit caching) in
+0.4.0; this document is kept as the design record. Two deviations from the text below, both
+deliberate — the `Request` field is named **`context_cache`**, not `cache` (`req.cache` collides
+with the response cache this document opens by warning about), and the history breakpoint goes on
+the **last** turn, not the last *completed* turn (Anthropic's own multi-turn guidance says the
+most-recently-appended turn, which caches strictly more). §7's open questions are answered inline.
 **Author's note:** written after measuring a real workload (see *Why now*). Every number below was
 measured or read from a provider doc — nothing here is from memory.
 
@@ -19,8 +19,8 @@ measured or read from a provider doc — nothing here is from memory.
 
 ## 1. Why now
 
-The reference consumer files documents and answers questions about them. Measured
-on a real 58-page Hebrew PDF (Bituach Leumi claim, 4.1 MB), against `claude-sonnet-4-6`:
+The motivating workload is document Q&A: an application files documents and answers questions
+about them. Measured on a real 58-page Hebrew PDF (4.1 MB), against `claude-sonnet-4-6`:
 
 | Call | Input tokens | Cost |
 |---|---:|---:|
@@ -229,8 +229,8 @@ These are the things a caching PR will break if it is written without reading `r
 1. **The cache is model-scoped; the router picks the model.** A cache written on the `simple` tier
    is cold on `hard`. If `CLASSIFY_AND_ANSWER` escalates, the write premium (1.25×) is paid for
    nothing. **Rule:** only emit cache markers when the model is *pinned* (`complete(req,
-   model=...)`) or the strategy cannot escalate. A document path that pins its vision model, so it
-   qualifies; the conversation path escalates, so it should cache the system prefix only (cheap to
+   model=...)`) or the strategy cannot escalate. A document-QA path that pins its vision model
+   qualifies; a conversation path that may escalate should cache the system prefix only (cheap to
    re-write) and never the media.
 
 2. **`_with_guidance()` mutates the system prefix.** The CLASSIFY strategies prepend a guidance
@@ -320,16 +320,16 @@ is in the docs:
 
    **There is a dead band between the explicit floor (4,096) and roughly 10,000 tokens where
    implicit caching returns nothing and explicit caching returns everything.** That band is exactly
-   where an agent with a system prompt plus tool declarations lives: the consumer that motivated
-   this plan sits at ~4,420 tokens (persona + guidance + 17 tool schemas) and gets `cache_read=0` on
-   three identical back-to-back calls, while an explicit cache at the same size returns ~99% of the
-   prompt as a cache read.
+   where an agent with a system prompt plus tool declarations lives: the measured agent sits at
+   ~4,420 tokens (persona + guidance + 17 tool schemas) and gets `cache_read=0` on three identical
+   back-to-back calls, while an explicit cache at the same size returns ~99% of the prompt as a
+   cache read.
 
    Two things also ruled out while measuring, both worth not re-testing:
    - **Tool declarations do not break implicit caching.** With the same ~13,500-token prefix, both
      with and without 17 tools cached (11,674 and 8,169 read respectively). There is an open
      `vercel/ai` issue claiming otherwise; it does not reproduce here.
-   - **The §3.2 ordering is correct and is not the problem.** The consumer already sends
+   - **The §3.2 ordering is correct and is not the problem.** The measured agent already sends
      stable-first / volatile-last, and the miss is purely the size floor.
 3. **Small requests → no regression, and now asserted.** Reordering only happens when
    `context_cache.media` is set, and on a single-turn request the first user message *is* the last
@@ -345,14 +345,19 @@ is in the docs:
 
 ---
 
-## 8. Validation before release
+## 8. Validation
 
-Per the project rule: **integrate in a real consumer via a git dependency and validate there before
-any PyPI release.** The acceptance test is concrete and has a fixture — a 58-page document:
+The acceptance test, run end to end on a real document before release:
 
-1. Ask a question about it. Expect `cache_creation_input_tokens ≈ 100,000`, cost ≈ $0.375.
-2. Ask a second question within the TTL. Expect `cache_read_input_tokens ≈ 100,000`,
-   `input_tokens` ≈ the question only, cost ≈ **$0.03**.
-3. Confirm the consumer's usage-metrics hook reports the saving rather than a phantom re-spend.
+1. Ask a question about it. Expect `cache_creation_input_tokens` ≈ the document's size, at the
+   1.25× write premium.
+2. Ask a second question within the TTL. Expect `cache_read_input_tokens` ≈ the document's size,
+   `input_tokens` ≈ the question only, cost ≈ a tenth.
+3. Confirm a usage-metrics hook (`on_complete` over `usage_records`) reports the saving rather than
+   a phantom re-spend.
 
 If step 2 does not show a read, the feature does not work — regardless of what the unit tests say.
+
+**Outcome:** on a 79k-token PDF, a follow-up question went **$0.237 → $0.024** with
+`cache_read_input_tokens` ≈ 79,000. `tests/integration/test_prompt_caching_live.py` keeps the core
+of it as a live test: the same prefix sent twice, the second served from cache.
