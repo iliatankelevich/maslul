@@ -271,6 +271,10 @@ class Usage:
     cached tokens, while OpenAI, xAI and Gemini report a prompt total that *includes* them —
     so maslul subtracts the cached count on those three (``providers._common.split_input``) and
     normalizes on Anthropic's shape, the one that maps to money.
+
+    ``output_tokens`` is everything billed at the output price, **reasoning / thinking tokens
+    included**. Anthropic and OpenAI already count them in their output figure; xAI and Gemini
+    report them separately, so maslul adds them in.
     """
 
     input_tokens: int = 0

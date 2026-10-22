@@ -369,7 +369,11 @@ def _text(resp: Any) -> str:
 
 def _usage(um: Any) -> Usage:
     """``prompt_token_count`` is cached-**inclusive** on Gemini; maslul's convention is disjoint, so
-    the cached count is subtracted back out (see :class:`~maslul.Usage`)."""
+    the cached count is subtracted back out (see :class:`~maslul.Usage`).
+
+    ``thoughts_token_count`` is *not* part of ``candidates_token_count`` (the SDK defines the total
+    as their sum) and is billed as output, so both go into ``output_tokens``. Most Gemini 2.5+
+    models think by default, so counting only the candidates under-reported their calls."""
     if um is None:
         return Usage()
     billable, cached = split_input(
@@ -378,7 +382,8 @@ def _usage(um: Any) -> Usage:
     )
     return Usage(
         input_tokens=billable,
-        output_tokens=getattr(um, "candidates_token_count", 0) or 0,
+        output_tokens=(getattr(um, "candidates_token_count", 0) or 0)
+        + (getattr(um, "thoughts_token_count", 0) or 0),
         cache_read_input_tokens=cached,
     )
 

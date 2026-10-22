@@ -191,7 +191,11 @@ def _usage(u: Any) -> Usage:
     """xAI reports cached tokens as ``cached_prompt_text_tokens`` (not the ``prompt_tokens_details
     .cached_tokens`` its OpenAI-compatible surface suggests), and ``prompt_tokens`` **includes**
     them; maslul's convention is disjoint, so it is subtracted back out (see
-    :class:`~maslul.Usage`)."""
+    :class:`~maslul.Usage`).
+
+    ``reasoning_tokens`` sit *beside* ``completion_tokens``, not inside them, and are billed as
+    output, so both go into ``output_tokens``. Counting only the completion under-reported a
+    reasoning call by orders of magnitude (1 reported, 339 billed, on grok-4.3)."""
     if u is None:
         return Usage()
     billable, cached = split_input(
@@ -200,7 +204,8 @@ def _usage(u: Any) -> Usage:
     )
     return Usage(
         input_tokens=billable,
-        output_tokens=getattr(u, "completion_tokens", 0) or 0,
+        output_tokens=(getattr(u, "completion_tokens", 0) or 0)
+        + (getattr(u, "reasoning_tokens", 0) or 0),
         cache_read_input_tokens=cached,
     )
 
