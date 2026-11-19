@@ -382,10 +382,29 @@ async def test_anthropic_marks_the_last_system_block_only() -> None:
         ),
     )
     sent = fake.calls[0]
-    assert [b["text"] for b in sent["system"]] == ["guidance", "persona"]
-    assert "cache_control" not in sent["system"][0]
-    assert sent["system"][1]["cache_control"] == {"type": "ephemeral"}
+    assert sent["system"] == [
+        {"type": "text", "text": "guidance\n\npersona", "cache_control": {"type": "ephemeral"}}
+    ]
     assert len(_marked(sent)) == 1
+
+
+async def test_declaring_a_context_cache_does_not_change_the_system_text() -> None:
+    """A ``ContextCache`` is a hint: the model must read the same prompt with or without it."""
+    system = ["guidance", "persona", "facts"]
+    plain, cached = _FakeAnthropic(_anthropic_resp()), _FakeAnthropic(_anthropic_resp())
+    for fake, cache in ((plain, None), (cached, ContextCache())):
+        await AnthropicProvider(client=fake).complete(
+            _ANTHROPIC,
+            Request(
+                messages=[Message(role="user", content="hi")], system=system, context_cache=cache
+            ),
+        )
+    sent = cached.calls[0]["system"]
+    assert (
+        "".join(b["text"] for b in sent)
+        == plain.calls[0]["system"]
+        == "guidance\n\npersona\n\nfacts"
+    )
 
 
 async def test_anthropic_marks_the_last_media_block() -> None:

@@ -157,12 +157,15 @@ class AnthropicProvider:
         system_blocks: list[dict[str, Any]] | None = None
         system_block: dict[str, Any] | None = None
         if req.system:
+            joined = "\n\n".join(req.system)
             if cache is not None and cache.system:
-                system_blocks = [{"type": "text", "text": s} for s in req.system]
-                system_block = system_blocks[-1]
+                # One block, not one per entry: the API documents no separator between system
+                # blocks, so only a single block carries the same text as the uncached string.
+                system_block = {"type": "text", "text": joined}
+                system_blocks = [system_block]
                 kwargs["system"] = system_blocks
             else:
-                kwargs["system"] = "\n\n".join(req.system)
+                kwargs["system"] = joined
         _apply_sampling(kwargs, spec.model, params)
         if params.stop:
             kwargs["stop_sequences"] = params.stop
