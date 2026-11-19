@@ -6,6 +6,20 @@ All notable changes to **maslul** are documented here. The format follows
 
 ## [Unreleased]
 
+### Fixed
+
+- **`classify_and_answer`'s inline answer gets the same retry and fallback as an escalated turn.**
+  When the classifier model answered a tool turn itself, a `RateLimited` or `Timeout` anywhere in
+  its tool loop raised straight out of `Router.complete`. It now retries the same model with
+  backoff, resuming the loop so no tool runs twice and the classifier's first call is not repeated.
+  After the retries are spent it falls back to the `hard` tier (where its escalation sentinel
+  points) when `fallback` is enabled, again resuming. Usage and `on_error` fire once per real
+  model call; `on_complete` once per turn.
+- **The classifier's own first call is retried too**, with or without tools. If it still fails and
+  `fallback` is enabled, the original request is re-dispatched to the `hard` tier through the
+  normal path (routing reason `classify_and_answer:classifier_failed`); the failed attempts carry
+  no usage. With `fallback` off the error is raised. `AuthError` is never retried.
+
 ## [0.6.0] - 2026-10-22
 
 ### Added
