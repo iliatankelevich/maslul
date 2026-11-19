@@ -29,9 +29,9 @@ import json
 import os
 import random
 import re
-from collections.abc import Mapping, Sequence
+from collections.abc import Awaitable, Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field, replace
-from typing import Any
+from typing import Any, TypeVar
 
 from maslul.cache import Embedder, ResponseCache
 from maslul.config import RouterConfig
@@ -59,8 +59,12 @@ from maslul.types import (
     canonical_provider,
 )
 
+_T = TypeVar("_T")
+
 # Guard against a runaway tool loop.
 _MAX_TOOL_ITERATIONS = 8
+# Where an escalation goes when its sentinel names no known level.
+_DEFAULT_ESCALATION = Level.HARD
 # Headroom for a classify call — small, but enough for a thinking classifier to reason then label.
 _CLASSIFY_MAX_TOKENS = 512
 
@@ -345,7 +349,23 @@ class Router:
         spec = self._require_classifier()
         provider = self._provider_for(spec)
         guided = _with_guidance(req, _CLASSIFY_AND_ANSWER_GUIDANCE)
-        first = await self._invoke(provider, spec, guided)
+        try:
+            first = await self._with_retries(
+                req, spec, lambda: self._invoke(provider, spec, guided)
+            )
+        except AuthError:
+            raise
+        except ProviderError:
+            # No tool has run yet, so re-dispatching the original request is safe here, unlike
+            # after the seed. The failed attempts produced no response, so they carry no usage.
+            if not self._config.fallback:
+                raise
+            target_spec = self._spec_for_level(_DEFAULT_ESCALATION)
+            if target_spec == spec:
+                raise
+            return RoutingDecision(
+                target_spec, _DEFAULT_ESCALATION, "classify_and_answer:classifier_failed"
+            ), None
         target = _parse_escalation(first.text)
         if target is not None:  # declined → escalate; the classifier call still cost tokens
             record = ModelUsage(spec.provider, spec.model, first.usage)
@@ -370,7 +390,7 @@ class Router:
         classification: ModelUsage | None = None,
         *,
         seed: Response | None = None,
-        chain: Sequence[ModelSpec] | None = None,
+        chain: Iterable[ModelSpec] | None = None,
     ) -> Response:
         """Run the answer with resilience: try the model (retrying transient errors), and on
         persistent failure fall back to the next-higher tier. ``AuthError`` never retries or
@@ -391,29 +411,22 @@ class Router:
         for fallback_spec in chain if chain is not None else self._fallback_chain(spec, level):
             if turn is not None:
                 turn.responses = 0
-            for attempt in range(self._config.max_retries + 1):
+
+            async def attempt(fallback_spec: ModelSpec = fallback_spec) -> Response:
                 # Handed over once: the loop records the seed on entry, so a retry that got it
                 # again would count that model call twice.
+                nonlocal seed
                 attempt_seed, seed = seed, None
-                try:
-                    return await self._execute_once(
-                        fallback_spec, req, ledger, turn, classification, attempt_seed
-                    )
-                except AuthError:
-                    raise
-                except (RateLimited, Timeout) as e:  # transient → retry this model, then fall back
-                    last = e
-                    for cb in self._on_error:
-                        cb(req, fallback_spec, e)
-                    if attempt < self._config.max_retries:
-                        await self._sleep_backoff(attempt)
-                        continue
-                    break
-                except ProviderError as e:  # not retryable here → fall back to the next model
-                    last = e
-                    for cb in self._on_error:
-                        cb(req, fallback_spec, e)
-                    break
+                return await self._execute_once(
+                    fallback_spec, req, ledger, turn, classification, attempt_seed
+                )
+
+            try:
+                return await self._with_retries(req, fallback_spec, attempt)
+            except AuthError:
+                raise
+            except ProviderError as e:  # retries spent, or not retryable → the next model
+                last = e
         raise last if last is not None else ProviderError("no model available to execute request")
 
     async def _execute_once(
@@ -432,6 +445,27 @@ class Router:
         else:
             resp = await self._run_tool_loop(spec, provider, req, ledger, seed=seed, turn=turn)
         return self._finalize(req, resp, ledger, classification)
+
+    async def _with_retries(
+        self, req: Request, spec: ModelSpec, call: Callable[[], Awaitable[_T]]
+    ) -> _T:
+        attempt = 0
+        while True:
+            try:
+                return await call()
+            except AuthError:
+                raise
+            except (RateLimited, Timeout) as e:  # transient → retry this model
+                for cb in self._on_error:
+                    cb(req, spec, e)
+                if attempt >= self._config.max_retries:
+                    raise
+                await self._sleep_backoff(attempt)
+                attempt += 1
+            except ProviderError as e:  # not retryable here
+                for cb in self._on_error:
+                    cb(req, spec, e)
+                raise
 
     async def _invoke(self, provider: Provider, spec: ModelSpec, req: Request) -> Response:
         """One provider call, bounded by the per-call timeout (mapped to a retryable Timeout)."""
@@ -464,13 +498,14 @@ class Router:
     # The classifier is not a tier, so there is no "next tier up" to derive. An answer it gave
     # itself falls back to where its escalation sentinel points by default (HARD), which is the
     # same place a declined turn goes, and only when fallback is enabled.
-    def _inline_chain(self, spec: ModelSpec) -> Sequence[ModelSpec]:
-        chain = [spec]
+    def _inline_chain(self, spec: ModelSpec) -> Iterator[ModelSpec]:
+        yield spec
         if self._config.fallback:
-            hard = self._config.tiers.get(Level.HARD)
-            if hard is not None and hard not in chain:
-                chain.append(hard)
-        return chain
+            # Resolved on demand: an unconfigured tier is a ConfigError, as for an escalation, but
+            # only once a fallback is actually needed, not on every turn that would have worked.
+            target = self._spec_for_level(_DEFAULT_ESCALATION)
+            if target != spec:
+                yield target
 
     def _finalize(
         self,
@@ -661,7 +696,7 @@ def _parse_escalation(text: str) -> Level | None:
     match = _ESCALATE_RE.match(text or "")
     if match is None:
         return None
-    return _LEVEL_BY_NAME.get(match.group(1).lower(), Level.HARD)
+    return _LEVEL_BY_NAME.get(match.group(1).lower(), _DEFAULT_ESCALATION)
 
 
 def _with_guidance(req: Request, guidance: str) -> Request:

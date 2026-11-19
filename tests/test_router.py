@@ -17,6 +17,7 @@ from maslul import (
     Router,
     RoutingDecision,
     Strategy,
+    Timeout,
     ToolCall,
     ToolDef,
     Usage,
@@ -974,3 +975,115 @@ async def test_an_inline_auth_error_is_not_retried_or_fallen_back() -> None:
 
     assert len(cls.requests) == 2
     assert big.requests == []
+
+
+async def test_the_classifiers_first_call_is_retried_on_the_same_model() -> None:
+    cls = ScriptedProvider("cls", [RateLimited("429"), Timeout("slow"), _answer("hi")])
+    errors: list[Exception] = []
+    router = Router(
+        _inline_config(),
+        providers={"cls": cls, "big": ScriptedProvider("big", [])},
+        on_error=lambda _req, _spec, exc: errors.append(exc),
+    )
+
+    resp = await router.complete(_req())
+
+    assert resp.text == "hi"
+    assert len(cls.requests) == 3
+    assert [type(e) for e in errors] == [RateLimited, Timeout]
+    assert resp.level_used is None
+
+
+async def test_a_classifier_that_keeps_failing_hands_the_original_request_to_the_tier() -> None:
+    from maslul.router import _CLASSIFY_AND_ANSWER_GUIDANCE
+
+    cls = ScriptedProvider("cls", [RateLimited("429"), RateLimited("429")])
+    big = ScriptedProvider(
+        "big",
+        [
+            Response("", None, "big", "big", Usage(2, 1), tool_calls=[ToolCall("c1", "add", {})]),
+            Response("from hard", None, "big", "big", Usage(3, 1)),
+        ],
+    )
+    runs: list[str] = []
+    errors: list[str] = []
+    routes: list[RoutingDecision] = []
+    router = Router(
+        _inline_config(max_retries=1),
+        providers={"cls": cls, "big": big},
+        on_error=lambda _req, spec, _exc: errors.append(spec.model),
+        on_route=lambda _req, decision: routes.append(decision),
+    )
+
+    resp = await router.complete(_tool_req(_counting_executor(runs)))
+
+    assert resp.text == "from hard"
+    assert runs == ["c1"]
+    assert errors == ["floor", "floor"]
+    assert routes[0].reason == "classify_and_answer:classifier_failed"
+    assert resp.level_used is Level.HARD
+    assert [r.model for r in resp.usage_records] == ["big"]
+    assert resp.classification_usage is None
+    assert all(_CLASSIFY_AND_ANSWER_GUIDANCE not in (r.system or []) for r in big.requests)
+
+
+async def test_a_classifier_that_keeps_failing_raises_when_fallback_is_off() -> None:
+    cls = ScriptedProvider("cls", [RateLimited("429"), RateLimited("429")])
+    big = ScriptedProvider("big", [])
+    router = Router(
+        _inline_config(max_retries=1, fallback=False), providers={"cls": cls, "big": big}
+    )
+
+    with pytest.raises(RateLimited):
+        await router.complete(_req())
+
+    assert len(cls.requests) == 2
+    assert big.requests == []
+
+
+async def test_an_auth_error_on_the_classifiers_first_call_is_not_retried() -> None:
+    cls = ScriptedProvider("cls", [AuthError("bad key")])
+    big = ScriptedProvider("big", [])
+    router = Router(_inline_config(), providers={"cls": cls, "big": big})
+
+    with pytest.raises(AuthError):
+        await router.complete(_req())
+
+    assert len(cls.requests) == 1
+    assert big.requests == []
+
+
+async def test_a_failed_classifier_with_no_hard_tier_is_a_config_error_like_an_escalation() -> None:
+    config = _inline_config(max_retries=0)
+    del config["maslul"]["tiers"]["hard"]
+    config["maslul"]["default_level"] = "simple"
+    cls = ScriptedProvider("cls", [RateLimited("429")])
+    router = Router(config, providers={"cls": cls})
+
+    with pytest.raises(ConfigError):
+        await router.complete(_req())
+
+
+async def test_an_inline_answer_needs_no_hard_tier_when_nothing_fails() -> None:
+    config = _inline_config()
+    del config["maslul"]["tiers"]["hard"]
+    config["maslul"]["default_level"] = "simple"
+    cls = ScriptedProvider("cls", [_calls(ToolCall(id="c1", name="add", input={})), _answer("ok")])
+    router = Router(config, providers={"cls": cls})
+
+    resp = await router.complete(_tool_req(_counting_executor([])))
+
+    assert resp.text == "ok"
+
+
+async def test_an_inline_fallback_with_no_hard_tier_is_a_config_error_like_an_escalation() -> None:
+    config = _inline_config(max_retries=0)
+    del config["maslul"]["tiers"]["hard"]
+    config["maslul"]["default_level"] = "simple"
+    cls = ScriptedProvider(
+        "cls", [_calls(ToolCall(id="c1", name="add", input={})), RateLimited("429")]
+    )
+    router = Router(config, providers={"cls": cls})
+
+    with pytest.raises(ConfigError):
+        await router.complete(_tool_req(_counting_executor([])))
