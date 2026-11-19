@@ -354,13 +354,12 @@ class Router:
             )
             return decision, None
         # Answered: finish the turn at this tier — drive the tool loop if client tools are in play.
-        ledger: dict[tuple[str, str], Usage] = {}
         if req.tools and req.tool_executor is not None:
-            resp = await self._run_tool_loop(spec, provider, req, ledger, seed=first)
+            resp = await self._execute(spec, None, req, seed=first, chain=self._inline_chain(spec))
         else:
-            resp = first
-            _record(ledger, resp)
-        resp = self._finalize(req, resp, ledger)
+            ledger: dict[tuple[str, str], Usage] = {}
+            _record(ledger, first)
+            resp = self._finalize(req, first, ledger)
         return RoutingDecision(spec, None, "classify_and_answer:answered"), resp
 
     async def _execute(
@@ -369,6 +368,9 @@ class Router:
         level: Level | None,
         req: Request,
         classification: ModelUsage | None = None,
+        *,
+        seed: Response | None = None,
+        chain: Sequence[ModelSpec] | None = None,
     ) -> Response:
         """Run the answer with resilience: try the model (retrying transient errors), and on
         persistent failure fall back to the next-higher tier. ``AuthError`` never retries or
@@ -376,7 +378,8 @@ class Router:
 
         A tool loop survives its failed attempts: the next one resumes from the results already in
         hand, so no tool runs twice for one request, and the usage of every model call that
-        succeeded is counted."""
+        succeeded is counted. ``seed`` is a first response already fetched for ``spec``; it is used
+        once, by the first attempt, and ``chain`` replaces the tier-derived fallback chain."""
         ledger: dict[tuple[str, str], Usage] = {}
         if classification is not None:
             _record_usage(
@@ -385,13 +388,16 @@ class Router:
         has_tools = bool(req.tools) and req.tool_executor is not None
         turn = _ToolTurn(list(req.messages)) if has_tools else None
         last: MaslulError | None = None
-        for fallback_spec in self._fallback_chain(spec, level):
+        for fallback_spec in chain if chain is not None else self._fallback_chain(spec, level):
             if turn is not None:
                 turn.responses = 0
             for attempt in range(self._config.max_retries + 1):
+                # Handed over once: the loop records the seed on entry, so a retry that got it
+                # again would count that model call twice.
+                attempt_seed, seed = seed, None
                 try:
                     return await self._execute_once(
-                        fallback_spec, req, ledger, turn, classification
+                        fallback_spec, req, ledger, turn, classification, attempt_seed
                     )
                 except AuthError:
                     raise
@@ -417,13 +423,14 @@ class Router:
         ledger: dict[tuple[str, str], Usage],
         turn: _ToolTurn | None,
         classification: ModelUsage | None,
+        seed: Response | None = None,
     ) -> Response:
         provider = self._provider_for(spec)
         if turn is None:
             resp = await self._invoke(provider, spec, req)
             _record(ledger, resp)
         else:
-            resp = await self._run_tool_loop(spec, provider, req, ledger, turn=turn)
+            resp = await self._run_tool_loop(spec, provider, req, ledger, seed=seed, turn=turn)
         return self._finalize(req, resp, ledger, classification)
 
     async def _invoke(self, provider: Provider, spec: ModelSpec, req: Request) -> Response:
@@ -452,6 +459,17 @@ class Router:
                     tier = self._config.tiers.get(higher)
                     if tier is not None and tier not in chain:
                         chain.append(tier)
+        return chain
+
+    # The classifier is not a tier, so there is no "next tier up" to derive. An answer it gave
+    # itself falls back to where its escalation sentinel points by default (HARD), which is the
+    # same place a declined turn goes, and only when fallback is enabled.
+    def _inline_chain(self, spec: ModelSpec) -> Sequence[ModelSpec]:
+        chain = [spec]
+        if self._config.fallback:
+            hard = self._config.tiers.get(Level.HARD)
+            if hard is not None and hard not in chain:
+                chain.append(hard)
         return chain
 
     def _finalize(
