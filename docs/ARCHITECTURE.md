@@ -187,6 +187,12 @@ The answer is wrapped in router-level resilience:
 - **The tool loop resumes** across retries and fallbacks: the next attempt continues from the tool
   results already in hand, so no tool runs twice for one request. Each tier gets its own iteration
   budget, and `usage_records` include every call that succeeded, even in an attempt that later failed.
+- **`classify_and_answer`'s inline answer is covered too.** The classifier's first call is retried on
+  the same model; if it still fails and `fallback` is on, the original request is re-dispatched to
+  the sentinel's default tier through the normal path (no tool has run, so that is safe). Once the
+  classifier has answered, a retry resumes the tool loop on the same model, and after the retries
+  it falls back to that tier, resuming the loop rather than re-running it, with the first call
+  never repeated.
 - **`AuthError` fails fast** — a key/permission problem won't be cured by retrying or falling back.
 
 The `MaslulError` hierarchy: `ConfigError` and `ProviderError` under `MaslulError`, with
