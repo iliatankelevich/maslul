@@ -6,6 +6,8 @@ All notable changes to **maslul** are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.6.1] - 2026-11-22
+
 ### Fixed
 
 - **`classify_and_answer`'s inline answer gets the same retry and fallback as an escalated turn.**
@@ -393,7 +395,8 @@ Initial release — an async, fully-typed LLM router across Anthropic, Gemini, a
 - Config from TOML or a plain dict (`Router.from_toml` / `Router(config=...)`), with the
   `provider:model` shorthand and env-var-referenced secrets.
 
-[Unreleased]: https://github.com/iliatankelevich/maslul/compare/v0.6.0...HEAD
+[Unreleased]: https://github.com/iliatankelevich/maslul/compare/v0.6.1...HEAD
+[0.6.1]: https://github.com/iliatankelevich/maslul/compare/v0.6.0...v0.6.1
 [0.6.0]: https://github.com/iliatankelevich/maslul/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/iliatankelevich/maslul/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/iliatankelevich/maslul/compare/v0.3.2...v0.4.0
