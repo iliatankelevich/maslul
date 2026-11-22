@@ -19,6 +19,12 @@ All notable changes to **maslul** are documented here. The format follows
   `fallback` is enabled, the original request is re-dispatched to the `hard` tier through the
   normal path (routing reason `classify_and_answer:classifier_failed`); the failed attempts carry
   no usage. With `fallback` off the error is raised. `AuthError` is never retried.
+- **Declaring a `ContextCache` no longer changes the Anthropic system prompt's text.** With
+  `ContextCache(system=True)` each `Request.system` entry was sent as its own content block, while
+  without one the entries are joined with a blank line; the API documents no separator between
+  system blocks, so the two requests could read differently. The entries are now joined with the
+  same blank line into one block, which carries the marker. The request differs from the uncached
+  one only by that marker.
 
 ## [0.6.0] - 2026-10-22
 
